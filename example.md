@@ -348,7 +348,7 @@ _No additional evidence captured._
 **Evidence:**
 
 ```
-Detected Apache server with mod_negotiation and MultiViews enabled, exposing a pseudo directory listing when invalid Accept headers are sent to extensionless filenames.
+Detected Apache server with mod_negotiation and MultiViews enabled, exposing a pseudo directory listing when invalid Accept headers are sent to extensionless filenames..
 ```
 
 </details>
