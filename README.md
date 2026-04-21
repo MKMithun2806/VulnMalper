@@ -28,10 +28,13 @@ Output: one clean **Markdown** report + a colored console summary. No JSON, no b
 
 ### From .deb (recommended)
 
-Download `vulnmalper_<version>_all.deb` from the [GitHub Releases](https://github.com/MKMithun2806) page and:
-
 ```bash
-sudo apt install ./vulnmalper_2.1.0_all.deb
+URL=$(curl -s https://api.github.com/repos/MKMithun2806/VulnMalper/releases/latest | grep browser_download_url | grep .deb | cut -d '"' -f 4) && \
+curl -L -o vulnmalper.deb "$URL" && \
+sudo apt install -y ./vulnmalper.deb && \
+sudo apt-get install -f -y && \
+rm -f vulnmalper.deb && \
+vulnmalper --help
 ```
 
 This drops `vulnmalper` on your `PATH`, a man page (`man vulnmalper`), and bash completion. Python 3.9+ is the only hard dep.
