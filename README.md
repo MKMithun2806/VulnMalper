@@ -33,8 +33,7 @@ URL=$(curl -s https://api.github.com/repos/MKMithun2806/VulnMalper/releases/late
 curl -L -o vulnmalper.deb "$URL" && \
 sudo apt install -y ./vulnmalper.deb && \
 sudo apt-get install -f -y && \
-rm -f vulnmalper.deb && \
-vulnmalper --help
+rm -f vulnmalper.deb
 ```
 
 This drops `vulnmalper` on your `PATH`, a man page (`man vulnmalper`), and bash completion. Python 3.9+ is the only hard dep.
