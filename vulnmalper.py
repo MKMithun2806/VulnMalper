@@ -268,7 +268,7 @@ def banner():
  ║   V u l n M a l p e r    v{VERSION}                       ║
  ║   fingerprint → scan → exploit-verify   pipeline     ║
  ║   httpx · whatweb · wafw00f · testssl · nikto        ║
- ║   nuclei · wapiti · sqlmap                           ║
+ ║   nuclei · wapiti · sqlmap · ffuf · feroxbuster      ║
  ║   local OR docker, auto-fallback                     ║
  ╚══════════════════════════════════════════════════════╝{C.R}
 """)
@@ -302,6 +302,11 @@ class WebTarget:
     waf:       Optional[str] = None
     # injectable URLs discovered by upstream tools (nikto/nuclei) during scan:
     injectable: list[str] = field(default_factory=list)
+    # flag to avoid recursive discovery loops
+    discovered: bool = False
+    # auto-mode strategy cache (set after Phase 1 when enabled)
+    auto_strategy: Optional[str] = None
+    auto_reason: str = ""
 
 # ── NetMalper graph parsing ─────────────────────────────────────────────────
 WEB_SERVICES = {"http","https","http-proxy","https-alt","http-alt"}
@@ -357,7 +362,7 @@ def parse_netmalper(graph: dict):
 
 # ── Runner layer (local + docker) ───────────────────────────────────────────
 ALL_TOOLS = ["httpx","whatweb","wafw00f","testssl","nikto",
-             "nuclei","wapiti","sqlmap"]
+             "nuclei","wapiti","sqlmap","ffuf","feroxbuster"]
 
 DOCKER_IMAGES = {
     "httpx":   "projectdiscovery/httpx:latest",
@@ -368,6 +373,8 @@ DOCKER_IMAGES = {
     "nuclei":  "projectdiscovery/nuclei:latest",
     "wapiti":  "cyberwatch/wapiti:latest",
     "sqlmap":  "googlesky/sqlmap:latest",
+    "ffuf":    "ghcr.io/ffuf/ffuf:latest",
+    "feroxbuster": "epi052/feroxbuster",
 }
 # Some tools publish their binary under a different name inside the image:
 DOCKER_ENTRYPOINTS = {
@@ -383,6 +390,8 @@ LOCAL_BINARIES = {
     "nuclei":  "nuclei",
     "wapiti":  "wapiti",
     "sqlmap":  "sqlmap",
+    "ffuf":    "ffuf",
+    "feroxbuster": "feroxbuster",
 }
 
 def have(cmd: str) -> bool:
@@ -465,6 +474,22 @@ def build_cmd(plan: ToolPlan, tool_args: list[str],
         docker += extra_docker
     docker += [plan.image]
     return docker + tool_args
+
+def ensure_wordlist(name: str, url: str) -> str:
+    """Download a wordlist to /tmp/vulnmalper_wordlists if missing."""
+    folder = "/tmp/vulnmalper_wordlists"
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, name)
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        return path
+    log("info", f"Downloading wordlist: {name} ...")
+    import urllib.request
+    try:
+        urllib.request.urlretrieve(url, path)
+        return path
+    except Exception as e:
+        log("err", f"Failed to download wordlist {name}: {e}")
+        return ""
 
 # ────────────────────────────────────────────────────────────────────────────
 #  PHASE 1 — FINGERPRINTING (always runs on every HTTP target)
@@ -915,10 +940,24 @@ def run_nuclei(t: WebTarget, plan: ToolPlan, severity: str, timeout: int):
     rl = STEALTH.polite_rl(150)
     args = ["-u", t.url, "-jsonl","-silent","-nc",
             "-severity", ",".join(keep),
-            "-timeout","10","-rl",str(rl),"-disable-update-check",
+            "-timeout","10","-rl",str(rl),
             "-H", f"User-Agent: {STEALTH.pick_ua()}"]
     for h in STEALTH.default_headers():
         args += ["-H", h]
+
+    # Handle template persistence for Docker
+    mounts = []
+    if plan.runner == "docker":
+        template_dir = "/tmp/vulnmalper_nuclei_templates"
+        os.makedirs(template_dir, exist_ok=True)
+        mounts.append((template_dir, "/root/nuclei-templates"))
+        # First run? Force update if directory is empty
+        if not os.listdir(template_dir):
+            log("info", "Nuclei templates missing, downloading...")
+            update_cmd = ["docker","run","--rm","-i","--network","host",
+                          "-v", f"{template_dir}:/root/nuclei-templates",
+                          plan.image, "-update-templates"]
+            _run(update_cmd, 300)
 
     # ── Stealth: smaller, smarter probing under --polite / --slow / --quiet
     # Default nuclei = 25 templates × 25 hosts in parallel = obvious burst.
@@ -990,11 +1029,9 @@ def run_wapiti(t: WebTarget, plan: ToolPlan, timeout: int):
     extra = ["-A", STEALTH.pick_ua()]
     for h in STEALTH.default_headers():
         extra += ["-H", h]
-    # Use jittered delay (±50%) so two wapiti workers don't pace identically.
-    delay_s = STEALTH.jittered_delay() / 1000.0
-    if delay_s > 0:
-        # wapiti uses --max-parameters/--timeout; closest pacing flag is -t.
-        extra += ["-t", str(max(int(delay_s * 1000), 1000))]
+    # NOTE: Wapiti doesn't expose a true per-request delay flag. Do not map
+    # STEALTH delay to `-t` (request timeout), that would silently change
+    # timeout behavior instead of pacing.
     # Headless / SPA crawling: wapiti has no built-in headless browser
     # (NB: lynx is text-only, can't execute JS either — both are dead ends
     # for SPAs like Juice Shop). What we CAN do is bump scope to "domain"
@@ -1044,6 +1081,91 @@ def run_wapiti(t: WebTarget, plan: ToolPlan, timeout: int):
             log("warn", f"wapiti JSON parse failed for {t.url}: {e}")
     shutil.rmtree(host_dir, ignore_errors=True)
     return findings
+
+def run_feroxbuster(t: WebTarget, plan: ToolPlan, timeout: int) -> tuple[list[Finding], list[str]]:
+    """Discover new directories. Returns (findings, new_urls)."""
+    wl_url = "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/common.txt"
+    wl_path = ensure_wordlist("common.txt", wl_url)
+    if not wl_path: return [], []
+
+    host_dir = f"/tmp/vulnmalper_ferox_{abs(hash(t.url))}"
+    os.makedirs(host_dir, exist_ok=True)
+    report = "ferox.txt"
+    
+    args = ["-u", t.url, "-w", "/wl/wl.txt" if plan.runner == "docker" else wl_path,
+            "-d", "2", "--silent", "-o", f"/wrk/{report}" if plan.runner == "docker" else os.path.join(host_dir, report)]
+    
+    if plan.runner == "docker":
+        docker = ["docker","run","--rm","-i","--network","host",
+                  "-v", f"{host_dir}:/wrk", "-v", f"{os.path.dirname(wl_path)}:/wl",
+                  plan.image]
+        cmd = docker + args
+    else:
+        cmd = [LOCAL_BINARIES["feroxbuster"]] + args
+
+    rc, out, err = _run(cmd, timeout)
+    new_urls = []
+    findings = []
+    host_report = os.path.join(host_dir, report)
+    if os.path.exists(host_report):
+        with open(host_report) as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 5 and parts[0] == "200":
+                    url = parts[-1]
+                    if url.rstrip("/") != t.url.rstrip("/"):
+                        new_urls.append(url)
+                        findings.append(Finding(
+                            target=t.url, tool="feroxbuster", severity="info",
+                            title=f"Discovered directory: {url}",
+                            detail=f"Found via feroxbuster recursive scan.\nFull path: {url}",
+                        ))
+    shutil.rmtree(host_dir, ignore_errors=True)
+    return findings, list(set(new_urls))
+
+def run_ffuf(t: WebTarget, plan: ToolPlan, timeout: int) -> tuple[list[Finding], list[str]]:
+    """Fuzz for specific files/configs. Returns (findings, new_urls)."""
+    wl_url = "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/raft-small-files.txt"
+    wl_path = ensure_wordlist("raft-small-files.txt", wl_url)
+    if not wl_path: return [], []
+
+    host_dir = f"/tmp/vulnmalper_ffuf_{abs(hash(t.url))}"
+    os.makedirs(host_dir, exist_ok=True)
+    report = "ffuf.json"
+
+    target_url = t.url.rstrip("/") + "/FUZZ"
+    args = ["-u", target_url, "-w", "/wl/wl.txt" if plan.runner == "docker" else wl_path,
+            "-mc", "200", "-of", "json", "-o", f"/wrk/{report}" if plan.runner == "docker" else os.path.join(host_dir, report),
+            "-s"]
+    
+    if plan.runner == "docker":
+        docker = ["docker","run","--rm","-i","--network","host",
+                  "-v", f"{host_dir}:/wrk", "-v", f"{os.path.dirname(wl_path)}:/wl",
+                  plan.image]
+        cmd = docker + args
+    else:
+        cmd = [LOCAL_BINARIES["ffuf"]] + args
+
+    rc, out, err = _run(cmd, timeout)
+    new_urls = []
+    findings = []
+    host_report = os.path.join(host_dir, report)
+    if os.path.exists(host_report):
+        try:
+            with open(host_report) as f:
+                data = json.load(f)
+                for res in data.get("results", []):
+                    u = res.get("url")
+                    new_urls.append(u)
+                    findings.append(Finding(
+                        target=t.url, tool="ffuf", severity="info",
+                        title=f"Discovered file: {u}",
+                        detail=f"Found via ffuf config fuzzing.\nFull path: {u}",
+                        raw=res
+                    ))
+        except Exception: pass
+    shutil.rmtree(host_dir, ignore_errors=True)
+    return findings, list(set(new_urls))
 
 # ────────────────────────────────────────────────────────────────────────────
 #  PHASE 2.5 — ACTIVE SERVICE CHAINING
@@ -1371,6 +1493,15 @@ def _format_auto_banner(t: WebTarget, strategy: str, reason: str,
                  + ("±jitter" if prof.jitter and prof.delay_ms else ""))
     return (f"{C.MG}[auto]{C.R} {t.url} → {label}  "
             f"({C.GY}{reason}{C.R})  ·  " + " · ".join(knobs))
+
+def _ensure_auto_strategy(t: WebTarget) -> tuple[str, str]:
+    """Resolve and cache auto strategy/reason once per target."""
+    if t.auto_strategy and t.auto_reason:
+        return t.auto_strategy, t.auto_reason
+    strategy, reason = detect_strategy(t)
+    t.auto_strategy = strategy
+    t.auto_reason = reason
+    return strategy, reason
 
 def run_service_chain(t: WebTarget, timeout: int = 15) -> list[Finding]:
     """If t looks like a known service (by port + tech fingerprint), run its
@@ -1855,6 +1986,8 @@ def main():
     ap.add_argument("--nuclei-timeout",   type=int, default=600)
     ap.add_argument("--wapiti-timeout",   type=int, default=1200)
     ap.add_argument("--sqlmap-timeout",   type=int, default=900)
+    ap.add_argument("--ffuf-timeout",     type=int, default=600)
+    ap.add_argument("--feroxbuster-timeout", type=int, default=900)
 
     # ── Stealth / polite-mode flags ─────────────────────────────────────
     sg = ap.add_argument_group("stealth / polite-mode",
@@ -1904,7 +2037,7 @@ def main():
              "`--no-timeout=7200` (all tools, 2h) or "
              "`--no-timeout nuclei,nikto=10800` (those two, 3h). "
              "Valid tool names: httpx, whatweb, wafw00f, testssl, nikto, "
-             "nuclei, wapiti, sqlmap.")
+             "nuclei, wapiti, sqlmap, ffuf, feroxbuster.")
 
     # ── JSON export flag ───────────────────────────────────────────────
     ap.add_argument("--export-json", nargs="?", const="__AUTO__", default=None,
@@ -2012,7 +2145,15 @@ def main():
         "wafw00f": args.wafw00f_timeout, "testssl": args.testssl_timeout,
         "nikto": args.nikto_timeout, "nuclei": args.nuclei_timeout,
         "wapiti": args.wapiti_timeout, "sqlmap": args.sqlmap_timeout,
+        "ffuf": args.ffuf_timeout, "feroxbuster": args.feroxbuster_timeout,
     }
+
+    # Disable aggressive fuzzers if ANY stealth/polite flags are set
+    if STEALTH.polite or STEALTH.slow or STEALTH.quiet or not STEALTH.jitter:
+        if plans["ffuf"] or plans["feroxbuster"]:
+            log("warn", "Stealth/Polite mode active — disabling aggressive fuzzers (ffuf, feroxbuster)")
+            plans["ffuf"] = None
+            plans["feroxbuster"] = None
 
     # ── --no-timeout: extend per-tool runtime budgets ──────────────────────
     if args.no_timeout is not None:
@@ -2074,6 +2215,87 @@ def main():
             for fs in ex.map(_fp_worker, alive):
                 all_findings.extend(fs)
 
+    # ── PHASE 1.5: discovery ───────────────────────────────────────────────
+    discovery_enabled = plans["ffuf"] or plans["feroxbuster"]
+    if discovery_enabled:
+        _phase("Phase 1.5 — Discovery (feroxbuster, ffuf)")
+        DISCOVERY_TECHS = {"api", "rest", "node.js", "php", "asp.net", "java", 
+                           "python", "go", "ruby", "django", "flask", "laravel", "express"}
+        discovered_targets = []
+        
+        def _discovery_worker(t: WebTarget):
+            new_targets = []
+            local_findings = []
+            if auto_mode:
+                # Auto mode picks strategy per target. If this target is
+                # classified as stealth, skip aggressive discovery fuzzers.
+                strategy, reason = _ensure_auto_strategy(t)
+                if strategy == "stealth":
+                    log("skip", f"discovery → {t.url} skipped in auto stealth mode ({reason})")
+                    return [], []
+            # Trigger logic: Status 200/403 OR Tech match
+            tech_match = any(dt in " ".join(t.tech).lower() for dt in DISCOVERY_TECHS)
+            status_match = t.status in (200, 403)
+            
+            if not (tech_match or status_match):
+                return [], []
+
+            if plans["feroxbuster"]:
+                log("run", f"feroxbuster discovery → {t.url}")
+                fs, urls = run_feroxbuster(t, plans["feroxbuster"], timeouts["feroxbuster"])
+                local_findings.extend(fs)
+                for u in urls:
+                    p = urllib.parse.urlparse(u)
+                    new_targets.append(WebTarget(
+                        url=u, host=p.hostname or "", port=p.port or (443 if p.scheme == "https" else 80),
+                        scheme=p.scheme, alive=True, discovered=True
+                    ))
+            
+            if plans["ffuf"]:
+                log("run", f"ffuf config discovery → {t.url}")
+                fs, urls = run_ffuf(t, plans["ffuf"], timeouts["ffuf"])
+                local_findings.extend(fs)
+                for u in urls:
+                    p = urllib.parse.urlparse(u)
+                    new_targets.append(WebTarget(
+                        url=u, host=p.hostname or "", port=p.port or (443 if p.scheme == "https" else 80),
+                        scheme=p.scheme, alive=True, discovered=True
+                    ))
+            return local_findings, new_targets
+
+        alive = [t for t in targets if t.alive and not t.discovered]
+        if alive:
+            log("info", f"Running discovery on {len(alive)} candidate(s) based on tech/status triggers")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as ex:
+                for fs, results in ex.map(_discovery_worker, alive):
+                    all_findings.extend(fs)
+                    discovered_targets.extend(results)
+        
+        if discovered_targets:
+            # Dedupe discovered targets
+            unique_new = {}
+            for nt in discovered_targets:
+                if nt.url not in [t.url for t in targets] and nt.url not in unique_new:
+                    unique_new[nt.url] = nt
+            
+            new_list = list(unique_new.values())
+            if new_list:
+                log("ok", f"Discovered {len(new_list)} new targets! Adding to full stack scan pool.")
+                targets.extend(new_list)
+                # For newly discovered targets, we might want to run Phase 1 (httpx/whatweb) on them too?
+                # The user said "the full stack shud also scan whatewver ffuf or feroxbuster found".
+                # Nikto/Nuclei/Wapiti are in Phase 2. So they will be scanned.
+                # But they might need tech info. Let's run a quick fingerprint on them.
+                if plans["httpx"]:
+                    log("run", f"httpx fingerprinting {len(new_list)} new target(s)")
+                    fs = run_httpx(new_list, plans["httpx"], timeouts["httpx"])
+                    all_findings.extend(fs)
+                
+                # whatweb/wafw00f for new targets
+                with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as ex:
+                    for fs in ex.map(_fp_worker, new_list):
+                        all_findings.extend(fs)
+
     # ── PHASE 2: scan ──────────────────────────────────────────────────────
     _phase("Phase 2 — Scanning (testssl, nikto, nuclei, wapiti)")
 
@@ -2092,7 +2314,7 @@ def main():
         # tool exception can't leak the wrong profile into the next target.
         swapped = False
         if auto_mode:
-            strategy, reason = detect_strategy(t)
+            strategy, reason = _ensure_auto_strategy(t)
             new_prof = build_auto_profile(strategy, base_stealth)
             log("info", _format_auto_banner(t, strategy, reason, new_prof))
             STEALTH = new_prof
@@ -2150,6 +2372,15 @@ def main():
     # what the responses mean. Cheap, offline, and catches the "obvious"
     # exposures every pentester checks first.
     chainable = [t for t in targets if t.alive and t.port in SERVICE_CHAIN_PLAYBOOKS]
+    if auto_mode:
+        filtered: list[WebTarget] = []
+        for t in chainable:
+            strategy, reason = _ensure_auto_strategy(t)
+            if strategy == "stealth":
+                log("skip", f"chain → {t.url} skipped in auto stealth mode ({reason})")
+                continue
+            filtered.append(t)
+        chainable = filtered
     if chainable:
         _phase("Phase 2.5 — Active service chaining (Prometheus, Consul, "
                "Grafana, Docker API, …)")
@@ -2163,6 +2394,12 @@ def main():
 
     sqli_queue: list[str] = []
     for t in targets:
+        if auto_mode:
+            strategy, reason = _ensure_auto_strategy(t)
+            if strategy == "stealth":
+                if t.injectable:
+                    log("skip", f"sqlmap candidates on {t.url} skipped in auto stealth mode ({reason})")
+                continue
         for u in t.injectable:
             if u not in sqli_queue:
                 sqli_queue.append(u)
