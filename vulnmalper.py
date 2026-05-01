@@ -373,7 +373,7 @@ DOCKER_IMAGES = {
     "nuclei":  "projectdiscovery/nuclei:latest",
     "wapiti":  "cyberwatch/wapiti:latest",
     "sqlmap":  "googlesky/sqlmap:latest",
-    "ffuf":    "ghcr.io/ffuf/ffuf:latest",
+    "ffuf":    "secsi/ffuf:latest",
     "feroxbuster": "epi052/feroxbuster",
 }
 # Some tools publish their binary under a different name inside the image:
@@ -1293,6 +1293,39 @@ def _http_probe(url: str, timeout: int = 10) -> tuple[int, str]:
         return e.code, body
     except Exception:
         return 0, ""
+
+def _tcp_probe(host: str, port: int, timeout: int = 4) -> bool:
+    """Best-effort TCP liveness probe for hosts that don't answer HTTP cleanly."""
+    if not host or not port:
+        return False
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+def confirm_target_liveness(t: WebTarget) -> bool:
+    """Double-check a target before considering it dead.
+
+    Strategy:
+      1) Retry HTTP probe on the exact URL twice.
+      2) If still no HTTP response, try a raw TCP connect to host:port.
+    """
+    # Two HTTP attempts (covers transient resets/timeouts).
+    for _ in range(2):
+        status, _ = _http_probe(t.url, timeout=8)
+        if status > 0:
+            t.alive = True
+            if t.status is None:
+                t.status = status
+            return True
+        time.sleep(0.35)
+    # HTTP can fail behind odd middleware; a successful TCP connect means
+    # the service is up enough to keep in scope for downstream tools.
+    if _tcp_probe(t.host, t.port, timeout=4):
+        t.alive = True
+        return True
+    return False
 
 # ────────────────────────────────────────────────────────────────────────────
 #  AUTO MODE — smart strategy detection (per-target)
@@ -2214,6 +2247,28 @@ def main():
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as ex:
             for fs in ex.map(_fp_worker, alive):
                 all_findings.extend(fs)
+
+    # Before we classify a target as dead, do one last explicit recheck.
+    dead_candidates = [t for t in targets if not t.alive]
+    if dead_candidates:
+        revived = 0
+        log("info", f"Rechecking {len(dead_candidates)} target(s) that looked dead...")
+        for t in dead_candidates:
+            if confirm_target_liveness(t):
+                revived += 1
+                all_findings.append(Finding(
+                    target=t.url, tool="liveness-check", severity="info",
+                    title=f"Target responded on recheck ({t.status or 'tcp-open'})",
+                    detail="Initial fingerprint missed this host; revived before scan phases.",
+                ))
+        if revived:
+            log("ok", f"Liveness recheck revived {revived} target(s)")
+            # Backfill tech/WAF on revived targets before deeper scans.
+            revived_targets = [t for t in targets if t.alive and not t.tech and not t.waf]
+            if revived_targets and (plans["whatweb"] or plans["wafw00f"]):
+                with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as ex:
+                    for fs in ex.map(_fp_worker, revived_targets):
+                        all_findings.extend(fs)
 
     # ── PHASE 1.5: discovery ───────────────────────────────────────────────
     discovery_enabled = plans["ffuf"] or plans["feroxbuster"]
