@@ -472,7 +472,7 @@ def build_cmd(plan: ToolPlan, tool_args: list[str],
 def run_httpx(targets: list[WebTarget], plan: ToolPlan, timeout: int):
     """Probe alive + fingerprint tech/server/status for every target."""
     urls = "\n".join(t.url for t in targets)
-    args = ["-silent","-json","-nc","-no-color","-timeout","10",
+    args = ["-silent","-json","-l","-","-nc","-no-color","-timeout","10",
             "-tech-detect","-status-code","-title","-server","-follow-redirects"]
     # Stealth: random browser UA + extra (jittered) headers on every probe.
     args += ["-H", f"User-Agent: {STEALTH.pick_ua()}"]
@@ -484,37 +484,48 @@ def run_httpx(targets: list[WebTarget], plan: ToolPlan, timeout: int):
     # Cap parallel fan-out so a 50-target graph doesn't burst-probe.
     if STEALTH.polite or STEALTH.slow:
         args += ["-threads", "10" if STEALTH.slow else "25"]
-    cmd  = build_cmd(plan, args)
-    rc, out, err = _run(cmd, timeout, stdin_data=urls)
     by_url = {t.url: t for t in targets}
     findings: list[Finding] = []
-    for line in out.splitlines():
-        line = line.strip()
-        if not line.startswith("{"): continue
-        try: j = json.loads(line)
-        except Exception: continue
-        u = j.get("url") or j.get("input") or ""
-        t = by_url.get(u)
-        # some httpx builds normalize trailing slashes etc.
-        if not t:
-            for k, v in by_url.items():
-                if k.rstrip("/") == u.rstrip("/"): t = v; break
-        if not t: continue
-        t.alive  = True
-        t.status = j.get("status_code") or j.get("status-code")
-        techs    = j.get("tech") or j.get("technologies") or []
-        if isinstance(techs, list): t.tech = [str(x) for x in techs]
-        server   = j.get("webserver") or j.get("server") or ""
-        title    = j.get("title") or ""
-        detail_parts = []
-        if server: detail_parts.append(f"server={server}")
-        if t.tech: detail_parts.append("tech=" + ", ".join(t.tech))
-        if title:  detail_parts.append(f"title={title[:80]}")
-        findings.append(Finding(
-            target=t.url, tool="httpx", severity="info",
-            title=f"Alive ({t.status}) — {server or 'unknown server'}",
-            detail=" · ".join(detail_parts), raw=j,
-        ))
+
+    def _parse_httpx_output(out: str):
+        for line in out.splitlines():
+            line = line.strip()
+            if not line.startswith("{"): continue
+            try: j = json.loads(line)
+            except Exception: continue
+            u = j.get("url") or j.get("input") or ""
+            t = by_url.get(u)
+            # some httpx builds normalize trailing slashes etc.
+            if not t:
+                for k, v in by_url.items():
+                    if k.rstrip("/") == u.rstrip("/"): t = v; break
+            if not t: continue
+            t.alive  = True
+            t.status = j.get("status_code") or j.get("status-code")
+            techs    = j.get("tech") or j.get("technologies") or []
+            if isinstance(techs, list): t.tech = [str(x) for x in techs]
+            server   = j.get("webserver") or j.get("server") or ""
+            title    = j.get("title") or ""
+            detail_parts = []
+            if server: detail_parts.append(f"server={server}")
+            if t.tech: detail_parts.append("tech=" + ", ".join(t.tech))
+            if title:  detail_parts.append(f"title={title[:80]}")
+            findings.append(Finding(
+                target=t.url, tool="httpx", severity="info",
+                title=f"Alive ({t.status}) — {server or 'unknown server'}",
+                detail=" · ".join(detail_parts), raw=j,
+            ))
+
+    cmd  = build_cmd(plan, args)
+    rc, out, err = _run(cmd, timeout, stdin_data=urls)
+    _parse_httpx_output(out)
+    if targets and not findings:
+        log("warn", "httpx returned 0 results, falling back to direct probing")
+        single_args = args[:2] + args[4:]
+        for t in targets:
+            cmd = build_cmd(plan, single_args + ["-u", t.url])
+            rc, out, err = _run(cmd, timeout)
+            _parse_httpx_output(out)
     return findings
 
 def run_whatweb(t: WebTarget, plan: ToolPlan, timeout: int):
