@@ -45,7 +45,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-VERSION = "2.9.0"
+VERSION = "10.0.0"
 
 # ── Stealth / polite-mode profile ───────────────────────────────────────────
 # Realistic, current desktop browser User-Agents. One is picked per run (or
@@ -364,7 +364,7 @@ DOCKER_IMAGES = {
     "whatweb": "secsi/whatweb:latest",
     "wafw00f": "secsi/wafw00f:latest",
     "testssl": "drwetter/testssl.sh:latest",
-    "nikto":   "sullo/nikto:latest",
+    "nikto":   "ghcr.io/sullo/nikto",
     "nuclei":  "projectdiscovery/nuclei:latest",
     "wapiti":  "cyberwatch/wapiti:latest",
     "sqlmap":  "googlesky/sqlmap:latest",
@@ -683,7 +683,7 @@ NIKTO_NOISE_RE = re.compile(
 #   * Ubuntu/Debian apt ships 2.1.6 (2014):  no -Add-header, no -nointeractive,
 #                                            no -maxtime in seconds form,
 #                                            -host wants a hostname (not URL).
-#   * sullo/nikto:latest docker image is current 2.5.0+: full option set.
+#   * ghcr.io/sullo/nikto docker image is current 2.5.0+: full option set.
 #   * Newest from-source builds (2.6.0):     -Add-header, -nointeractive,
 #                                            -host accepts full URL.
 # We probe `nikto -Help` ONCE per binary and cache which options are
