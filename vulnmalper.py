@@ -45,7 +45,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-VERSION = "10.0.0"
+VERSION = "4.0.0"
 
 # ── Stealth / polite-mode profile ───────────────────────────────────────────
 # Realistic, current desktop browser User-Agents. One is picked per run (or
@@ -364,7 +364,7 @@ DOCKER_IMAGES = {
     "whatweb": "secsi/whatweb:latest",
     "wafw00f": "secsi/wafw00f:latest",
     "testssl": "drwetter/testssl.sh:latest",
-    "nikto":   "ghcr.io/sullo/nikto",
+    "nikto":   "ghcr.io/sullo/nikto:latest",
     "nuclei":  "projectdiscovery/nuclei:latest",
     "wapiti":  "cyberwatch/wapiti:latest",
     "sqlmap":  "googlesky/sqlmap:latest",
