@@ -1663,6 +1663,13 @@ def run_sqlmap(url: str, plan: ToolPlan, timeout: int, post_data: str = "", cook
     # Enhanced techniques: include all SQLi types
     # B=Boolean-based blind, E=Error-based, U=Union, S=Stacked, T=Time-based, Q=Inline query
     extra += ["--technique", "BEUSTQ"]
+    
+    # For demo/vulnerable targets, be more aggressive
+    # Skip smart mode, go straight to full scan
+    extra += ["--smart"]  # Keep smart but combine with other options
+    
+    # No prompt for user interaction
+    extra += ["--batch", "--non-interactive"]
 
     if plan.runner == "docker":
         container_dir = "/wrk"
@@ -2574,6 +2581,22 @@ def main():
                 url_with_param = t.url.rstrip("/") + "?" + param + "="
                 if url_with_param not in t.injectable:
                     t.injectable.append(url_with_param)
+    
+    # Also try login forms with POST data - these are common SQLi targets
+    # Try common login endpoints with POST data
+    LOGIN_PARAMS = [
+        ("/admin/doLogin", "username=admin&password="),
+        ("/doLogin", "username=admin&password="),
+        ("/login", "username=admin&password="),
+        ("/auth", "username=admin&password="),
+    ]
+    for t in targets:
+        for path, post_template in LOGIN_PARAMS:
+            if path in t.url or t.url.endswith("/admin") or "login" in t.url:
+                full_url = t.url.rstrip("/") + path if path.startswith("/") else t.url + path
+                post_url = full_url + "?" + post_template.split("&")[0] + "="
+                if post_url not in t.injectable:
+                    t.injectable.append(post_url)
 
     sqli_queue: list[str] = []
     for t in targets:
@@ -2599,7 +2622,15 @@ def main():
         def _sqli_worker(u):
             log("run", f"sqlmap ({plans['sqlmap'].runner}) → {u}")
             tt = time.time()
-            fs = run_sqlmap(u, plans["sqlmap"], timeouts["sqlmap"])
+            # For POST forms, extract post_data from URL
+            post_data = ""
+            if "&" in u and "?" in u:
+                # URL like http://host/admin/doLogin?username=admin&password=
+                # Extract the query part as POST data
+                query_part = u.split("?")[-1]
+                post_data = query_part.replace("=", "=test&") + "test"
+                u = u.split("?")[0]
+            fs = run_sqlmap(u, plans["sqlmap"], timeouts["sqlmap"], post_data=post_data)
             log("ok" if fs else "skip",
                 f"  sqlmap {round(time.time()-tt,1)}s — {len(fs)} findings")
             return fs
