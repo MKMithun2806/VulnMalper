@@ -968,13 +968,21 @@ def run_nuclei(t: WebTarget, plan: ToolPlan, severity: str, timeout: int):
         template_dir = "/tmp/vulnmalper_nuclei_templates"
         os.makedirs(template_dir, exist_ok=True)
         mounts.append((template_dir, "/root/nuclei-templates"))
-        # First run? Force update if directory is empty
-        if not os.listdir(template_dir):
-            log("info", "Nuclei templates missing, downloading...")
-            update_cmd = ["docker","run","--rm","-i","--network","host",
-                          "-v", f"{template_dir}:/root/nuclei-templates",
-                          plan.image, "-update-templates"]
-            _run(update_cmd, 300)
+        # Always try to update templates when using docker to ensure fresh copy
+        # Templates might be outdated or missing from previous runs
+        log("info", "Pulling latest Nuclei templates...")
+        update_cmd = ["docker","run","--rm","-i","--network","host",
+                      "-v", f"{template_dir}:/root/nuclei-templates",
+                      plan.image, "-update-templates"]
+        rc, out, err = _run(update_cmd, 300)
+        if rc != 0 or not out.strip():
+            log("warn", f"Nuclei template update failed (rc={rc}), retrying...")
+            # Retry once
+            rc2, out2, err2 = _run(update_cmd, 300)
+            if rc2 != 0:
+                log("warn", f"Nuclei templates update failed twice, trying without update")
+        else:
+            log("ok", f"Nuclei templates updated successfully")
 
     # ── Stealth: smaller, smarter probing under --polite / --slow / --quiet
     # Default nuclei = 25 templates × 25 hosts in parallel = obvious burst.
