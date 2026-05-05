@@ -1584,30 +1584,63 @@ def run_sqlmap(url: str, plan: ToolPlan, timeout: int):
     os.makedirs(host_dir, exist_ok=True)
     ua = STEALTH.pick_ua()
     extra = ["--user-agent", ua]
+
     # sqlmap accepts a single --headers="K1: V1\nK2: V2" string
     hdrs = STEALTH.default_headers()
     if hdrs:
-        extra += ["--headers", "\\n".join(hdrs)]
+        extra += ["--headers", "\n".join(hdrs)]
+
+    # WAF evasion: use tamper scripts and randomization
+    tamper_scripts = [
+        "between",      # SQL syntax alterations
+        "charencode",   # Character encoding
+        "charunicodeencode",  # Unicode encoding
+        "space2comment",  # Comment replacement
+        "lowercase",   # Keyword case variation
+    ]
+    extra += ["--tamper", ",".join(tamper_scripts)]
+
+    # Random user-agent to bypass WAF fingerprinting
+    extra += ["--random-agent"]
+
     if STEALTH.polite or STEALTH.slow:
         # delay (s) between requests
         d = max(1, int(STEALTH.polite_delay(500) / 1000))
         extra += ["--delay", str(d), "--safe-freq", "5"]
+
     if plan.runner == "docker":
         container_dir = "/wrk"
         args = ["-u", url, "--batch","--disable-coloring",
-                "--level","2","--risk","1","--smart",
+                "--level","5","--risk","3","--smart",
                 "--output-dir", container_dir,
-                "--timeout","15","--retries","1","--technique","BEUSTQ"] + extra
+                "--timeout","30","--retries","3","--technique","BEUSTQ"] + extra
         cmd = build_cmd(plan, args, mount=(host_dir, container_dir))
     else:
         args = ["-u", url, "--batch","--disable-coloring",
-                "--level","2","--risk","1","--smart",
+                "--level","5","--risk","3","--smart",
                 "--output-dir", host_dir,
-                "--timeout","15","--retries","1","--technique","BEUSTQ"] + extra
+                "--timeout","30","--retries","3","--technique","BEUSTQ"] + extra
         cmd = build_cmd(plan, args)
+
+    # Log the command for debugging
+    log("run", f"sqlmap: {' '.join(cmd[:8])}...")
+
     rc, out, err = _run(cmd, timeout)
     findings: list[Finding] = []
     text = out + "\n" + err
+
+    # Enhanced error detection and logging
+    error_patterns = {
+        "waf": r"(blocked|detected|waf|firewall|protection)",
+        "timeout": r"(timeout|timed out)",
+        "connection": r"(connection refused|reset|failed)",
+        "rate_limit": r"(rate limit|too many requests)",
+    }
+
+    for pattern_name, pattern in error_patterns.items():
+        if re.search(pattern, text, re.I):
+            log("warn", f"sqlmap: {pattern_name} issue detected for {url}")
+
     blocks = re.findall(
         r"Parameter:\s*(.+?)\n\s*Type:\s*(.+?)\n\s*Title:\s*(.+?)\n\s*Payload:\s*(.+?)(?:\n\s*\n|\Z)",
         text, re.S,
@@ -1619,8 +1652,16 @@ def run_sqlmap(url: str, plan: ToolPlan, timeout: int):
             detail=f"Title: {title.strip()}\nPayload: {payload.strip()}",
             reference="https://owasp.org/www-community/attacks/SQL_Injection",
         ))
-    if not findings and "is not injectable" in text.lower():
-        log("skip", f"sqlmap: no injectable params on {url}")
+
+    if not findings:
+        if "is not injectable" in text.lower():
+            log("skip", f"sqlmap: no injectable params on {url}")
+        elif "all parameters appear to be not injectable" in text.lower():
+            log("skip", f"sqlmap: no injection point found in {url}")
+        else:
+            # Log for debugging when no findings but also not explicitly "not injectable"
+            log("info", f"sqlmap: completed but no vulnerabilities found on {url}")
+
     shutil.rmtree(host_dir, ignore_errors=True)
     return findings
 
@@ -2446,6 +2487,13 @@ def main():
 
     # ── PHASE 3: sqlmap verification on curated endpoints ──────────────────
     _phase("Phase 3 — Verifying SQLi candidates (sqlmap)")
+
+    # Also scan all endpoints with query params even if Nuclei didn't flag them.
+    # This is a fallback to catch SQLi that Nuclei templates might miss,
+    # especially on standard patterns like login forms.
+    for t in targets:
+        if "?" in t.url and t.url not in t.injectable:
+            t.injectable.append(t.url)
 
     sqli_queue: list[str] = []
     for t in targets:
