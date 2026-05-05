@@ -45,7 +45,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-VERSION = "4.0.0"
+VERSION = "6.0.0"
 
 # ── Stealth / polite-mode profile ───────────────────────────────────────────
 # Realistic, current desktop browser User-Agents. One is picked per run (or
@@ -326,6 +326,12 @@ def _best_hostname_for_ip(ip: str, nodes: dict) -> Optional[str]:
             except Exception: continue
     return None
 
+def _normalize_url(url: str) -> str:
+    """Normalize URL by removing trailing slashes and ensuring consistent format."""
+    p = urllib.parse.urlparse(url)
+    path = p.path.rstrip("/") or "/"
+    return urllib.parse.urlunparse((p.scheme, p.netloc, path, p.params, p.query, p.fragment))
+
 def parse_netmalper(graph: dict):
     nodes = {n["id"]: n for n in graph.get("nodes", [])}
     meta  = graph.get("meta", {})
@@ -335,10 +341,12 @@ def parse_netmalper(graph: dict):
         if n["type"] != "endpoint": continue
         url = n["data"].get("url")
         if not url: continue
-        p = urllib.parse.urlparse(url)
+        # Normalize URL to remove trailing slashes
+        normalized_url = _normalize_url(url)
+        p = urllib.parse.urlparse(normalized_url)
         port = p.port or (443 if p.scheme == "https" else 80)
-        targets.setdefault(url, WebTarget(
-            url=url, host=p.hostname or "", port=port, scheme=p.scheme,
+        targets.setdefault(normalized_url, WebTarget(
+            url=normalized_url, host=p.hostname or "", port=port, scheme=p.scheme,
             service=p.scheme, has_query=bool(p.query), src_node=n["id"],
         ))
 
@@ -353,8 +361,11 @@ def parse_netmalper(graph: dict):
         scheme = "https" if (svc == "https" or port in (443,8443,9443)) else "http"
         host_label = _best_hostname_for_ip(host, nodes) or host
         url = f"{scheme}://{host_label}" + (f":{port}" if port not in (80,443) else "") + "/"
-        targets.setdefault(url, WebTarget(
-            url=url, host=host_label, port=port, scheme=scheme,
+        # Normalize URL to remove trailing slashes
+        normalized_url = _normalize_url(url)
+        p = urllib.parse.urlparse(normalized_url)
+        targets.setdefault(normalized_url, WebTarget(
+            url=normalized_url, host=host_label, port=p.port or port, scheme=scheme,
             service=svc or scheme, product=d.get("product",""),
             src_node=n["id"],
         ))
@@ -2371,9 +2382,11 @@ def main():
                 fs, urls = run_feroxbuster(t, plans["feroxbuster"], timeouts["feroxbuster"])
                 local_findings.extend(fs)
                 for u in urls:
-                    p = urllib.parse.urlparse(u)
+                    # Normalize URL to remove trailing slashes
+                    normalized_url = _normalize_url(u)
+                    p = urllib.parse.urlparse(normalized_url)
                     new_targets.append(WebTarget(
-                        url=u, host=p.hostname or "", port=p.port or (443 if p.scheme == "https" else 80),
+                        url=normalized_url, host=p.hostname or "", port=p.port or (443 if p.scheme == "https" else 80),
                         scheme=p.scheme, alive=True, discovered=True
                     ))
             
@@ -2382,9 +2395,11 @@ def main():
                 fs, urls = run_ffuf(t, plans["ffuf"], timeouts["ffuf"])
                 local_findings.extend(fs)
                 for u in urls:
-                    p = urllib.parse.urlparse(u)
+                    # Normalize URL to remove trailing slashes
+                    normalized_url = _normalize_url(u)
+                    p = urllib.parse.urlparse(normalized_url)
                     new_targets.append(WebTarget(
-                        url=u, host=p.hostname or "", port=p.port or (443 if p.scheme == "https" else 80),
+                        url=normalized_url, host=p.hostname or "", port=p.port or (443 if p.scheme == "https" else 80),
                         scheme=p.scheme, alive=True, discovered=True
                     ))
             return local_findings, new_targets
@@ -2398,11 +2413,13 @@ def main():
                     discovered_targets.extend(results)
         
         if discovered_targets:
-            # Dedupe discovered targets
+            # Dedupe discovered targets using composite key (host:port:scheme)
             unique_new = {}
             for nt in discovered_targets:
-                if nt.url not in [t.url for t in targets] and nt.url not in unique_new:
-                    unique_new[nt.url] = nt
+                # Composite key for better deduplication
+                comp_key = f"{nt.host}:{nt.port}:{nt.scheme}"
+                if comp_key not in unique_new and nt.url not in [t.url for t in targets]:
+                    unique_new[comp_key] = nt
             
             new_list = list(unique_new.values())
             if new_list:
@@ -2446,8 +2463,8 @@ def main():
             STEALTH = new_prof
             swapped = True
         try:
-            # testssl only for TLS ports
-            if plans["testssl"] and t.port in TLS_PORTS:
+            # testssl only for HTTPS (TLS) ports - check both port AND scheme
+            if plans["testssl"] and t.scheme == "https" and t.port in TLS_PORTS:
                 log("run", f"testssl ({plans['testssl'].runner}) → {t.url}")
                 tt = time.time()
                 fs = run_testssl(t, plans["testssl"], timeouts["testssl"])
@@ -2455,8 +2472,8 @@ def main():
                     f"  testssl {round(time.time()-tt,1)}s — {len(fs)} findings")
                 out.extend(fs)
                 STEALTH.sleep_jitter()  # avoid burst pattern between tools
-            # nikto only on classic web ports
-            if plans["nikto"] and t.port in NIKTO_PORTS:
+            # nikto only on HTTP/HTTPS ports with proper scheme check
+            if plans["nikto"] and t.scheme in ("http", "https") and t.port in NIKTO_PORTS:
                 log("run", f"nikto ({plans['nikto'].runner}) → {t.url}")
                 tt = time.time()
                 fs = run_nikto(t, plans["nikto"], timeouts["nikto"])
@@ -2534,8 +2551,10 @@ def main():
                     log("skip", f"sqlmap candidates on {t.url} skipped in auto stealth mode ({reason})")
                 continue
         for u in t.injectable:
-            if u not in sqli_queue:
-                sqli_queue.append(u)
+            # Normalize URL to remove trailing slashes for deduplication
+            normalized_u = _normalize_url(u)
+            if normalized_u not in sqli_queue:
+                sqli_queue.append(normalized_u)
 
     if not plans["sqlmap"]:
         log("skip", "sqlmap unavailable — skipping phase 3")
