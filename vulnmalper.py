@@ -1579,7 +1579,7 @@ def run_service_chain(t: WebTarget, timeout: int = 15) -> list[Finding]:
 # ────────────────────────────────────────────────────────────────────────────
 #  PHASE 3 — VERIFY (sqlmap, only on endpoints upstream flagged)
 # ────────────────────────────────────────────────────────────────────────────
-def run_sqlmap(url: str, plan: ToolPlan, timeout: int):
+def run_sqlmap(url: str, plan: ToolPlan, timeout: int, post_data: str = "", cookie: str = ""):
     host_dir = f"/tmp/vulnmalper_sqlmap_{abs(hash(url))}"
     os.makedirs(host_dir, exist_ok=True)
     ua = STEALTH.pick_ua()
@@ -1587,39 +1587,60 @@ def run_sqlmap(url: str, plan: ToolPlan, timeout: int):
 
     # sqlmap accepts a single --headers="K1: V1\nK2: V2" string
     hdrs = STEALTH.default_headers()
+
+    # Add cookie header if provided
+    if cookie:
+        hdrs.append(f"Cookie: {cookie}")
+
     if hdrs:
         extra += ["--headers", "\n".join(hdrs)]
 
-    # WAF evasion: use tamper scripts and randomization
+    # WAF evasion: enhanced tamper scripts for UNION, error-based, and blind SQLi
     tamper_scripts = [
-        "between",      # SQL syntax alterations
-        "charencode",   # Character encoding
-        "charunicodeencode",  # Unicode encoding
-        "space2comment",  # Comment replacement
-        "lowercase",   # Keyword case variation
+        "between",           # SQL syntax alterations (greater/less than)
+        "charencode",        # Character encoding
+        "charunicodeencode", # Unicode encoding
+        "space2comment",    # Comment replacement
+        "lowercase",        # Keyword case variation
+        "space2hash",       # Random space to HASH comment
+        "space2dash",       # Random space to DASH comment
+        "ifstring2iftag",  # IF string to IF tag
+        "modsecurityversioned", # Versioned comment
+        "xforwardedfor",   # X-Forwarded-For spoofing
     ]
     extra += ["--tamper", ",".join(tamper_scripts)]
 
-    # Random user-agent to bypass WAF fingerprinting
+    # Random user-agent and other evasion headers
     extra += ["--random-agent"]
 
+    # Add POST data if provided for form-based SQLi
+    if post_data:
+        extra += ["--data", post_data]
+
+    # Blind SQLi specific: add time-delay for boolean-based detection
     if STEALTH.polite or STEALTH.slow:
-        # delay (s) between requests
         d = max(1, int(STEALTH.polite_delay(500) / 1000))
         extra += ["--delay", str(d), "--safe-freq", "5"]
+    else:
+        # Small delay even in aggressive mode to avoid instant WAF blocks
+        extra += ["--delay", "0.5", "--safe-freq", "3"]
+
+    # Enhanced techniques: include all SQLi types
+    # B=Boolean-based blind, E=Error-based, U=Union, S=Stacked, T=Time-based, Q=Inline query
+    extra += ["--technique", "BEUSTQ"]
 
     if plan.runner == "docker":
         container_dir = "/wrk"
         args = ["-u", url, "--batch","--disable-coloring",
                 "--level","5","--risk","3","--smart",
                 "--output-dir", container_dir,
-                "--timeout","30","--retries","3","--technique","BEUSTQ"] + extra
+                "--timeout","30","--retries","3"] + extra
         cmd = build_cmd(plan, args, mount=(host_dir, container_dir))
     else:
         args = ["-u", url, "--batch","--disable-coloring",
                 "--level","5","--risk","3","--smart",
                 "--output-dir", host_dir,
-                "--timeout","30","--retries","3","--technique","BEUSTQ"] + extra
+                "--timeout","30","--retries","3"] + extra
         cmd = build_cmd(plan, args)
 
     # Log the command for debugging
@@ -1641,6 +1662,7 @@ def run_sqlmap(url: str, plan: ToolPlan, timeout: int):
         if re.search(pattern, text, re.I):
             log("warn", f"sqlmap: {pattern_name} issue detected for {url}")
 
+    # Extract SQLi findings with enhanced parsing
     blocks = re.findall(
         r"Parameter:\s*(.+?)\n\s*Type:\s*(.+?)\n\s*Title:\s*(.+?)\n\s*Payload:\s*(.+?)(?:\n\s*\n|\Z)",
         text, re.S,
@@ -1653,13 +1675,23 @@ def run_sqlmap(url: str, plan: ToolPlan, timeout: int):
             reference="https://owasp.org/www-community/attacks/SQL_Injection",
         ))
 
+    # Also capture findings from other sqlmap output formats
+    # Extract "it looks like the back-end DBMS" type findings
+    dbms_match = re.search(r"it looks like the back-end DBMS is '(.+?)'", text, re.I)
+    if dbms_match:
+        log("info", f"sqlmap: detected DBMS as {dbms_match.group(1)} for {url}")
+
+    # Extract any "vulnerability(ies) found" message
+    vuln_match = re.search(r"(\d+) vulnerability(?:ies)? found", text, re.I)
+    if vuln_match and int(vuln_match.group(1)) > 0:
+        log("ok", f"sqlmap: found {vuln_match.group(1)} vulnerability(ies) on {url}")
+
     if not findings:
         if "is not injectable" in text.lower():
             log("skip", f"sqlmap: no injectable params on {url}")
         elif "all parameters appear to be not injectable" in text.lower():
             log("skip", f"sqlmap: no injection point found in {url}")
         else:
-            # Log for debugging when no findings but also not explicitly "not injectable"
             log("info", f"sqlmap: completed but no vulnerabilities found on {url}")
 
     shutil.rmtree(host_dir, ignore_errors=True)
@@ -1754,13 +1786,11 @@ def _md_escape(s: str) -> str:
     return (s or "").replace("|", "\\|").replace("\n", " ").strip()
 
 def _sev_badge(sev: str) -> str:
-    """HTML <img> badge — works inside <summary> on GitHub *and* Obsidian.
-    Markdown image syntax breaks inside <summary>, so we emit raw HTML
-    with a fixed height and the emoji as fallback alt text."""
+    """Plain text badge - works everywhere including Obsidian.
+    Uses emoji + text for maximum compatibility."""
     sev = (sev or "unknown").lower()
-    url = _SEV_SHIELD.get(sev, _SEV_SHIELD["unknown"])
     emoji = _SEV_EMOJI.get(sev, "⚫")
-    return f'<img src="{url}" height="18" alt="{emoji} {sev}">'
+    return f"{emoji} {sev.upper()}"
 
 def _fence(text: str, lang: str = "") -> str:
     text = text.rstrip()
