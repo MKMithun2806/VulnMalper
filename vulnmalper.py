@@ -942,6 +942,12 @@ def run_nikto(t: WebTarget, plan: ToolPlan, timeout: int):
                 continue
             if cand not in t.injectable:
                 t.injectable.append(cand)
+        # Also extract any parameter-like patterns (e.g., ?id=, ?query=) from nikto msgs
+        param_patterns = re.findall(r'\?(\w+)=', msg)
+        for param in param_patterns:
+            url_with_param = t.url.rstrip("/") + "?" + param + "="
+            if url_with_param not in t.injectable:
+                t.injectable.append(url_with_param)
     shutil.rmtree(host_dir, ignore_errors=True)
     return findings
 
@@ -1006,6 +1012,16 @@ def run_nuclei(t: WebTarget, plan: ToolPlan, severity: str, timeout: int):
     rc, out, err = _run(cmd, timeout)
     findings: list[Finding] = []
     INJ_TAGS = {"sqli","sql-injection","injection","xss","ssti","lfi","rfi"}
+    
+    # Debug: log nuclei output stats
+    if out:
+        lines = out.strip().splitlines()
+        json_lines = [l for l in lines if l.startswith("{")]
+        log("info", f"nuclei: got {len(json_lines)} JSON results from {t.url}")
+    else:
+        log("warn", f"nuclei: no output for {t.url} (rc={rc})")
+        if err:
+            log("warn", f"nuclei stderr: {err[:500]}")
     for line in out.splitlines():
         line = line.strip()
         if not line.startswith("{"): continue
@@ -1086,8 +1102,16 @@ def run_wapiti(t: WebTarget, plan: ToolPlan, timeout: int):
                         detail=(f"{method} {path}\n{info_}").strip(),
                         raw=it,
                     ))
-                    if "sql" in category.lower() and "?" in full_url and full_url not in t.injectable:
-                        t.injectable.append(full_url)
+                    # Add URLs with parameters to injectable for sqlmap testing
+                    # Include SQLi, XSS, and any other parameter-based vulnerabilities
+                    if param and "?" not in full_url:
+                        injectable_url = full_url + "?" + param + "="
+                    elif param:
+                        injectable_url = full_url + "&" + param + "="
+                    else:
+                        injectable_url = full_url
+                    if injectable_url not in t.injectable:
+                        t.injectable.append(injectable_url)
         except Exception as e:
             log("warn", f"wapiti JSON parse failed for {t.url}: {e}")
     shutil.rmtree(host_dir, ignore_errors=True)
@@ -2541,6 +2565,15 @@ def main():
     for t in targets:
         if "?" in t.url and t.url not in t.injectable:
             t.injectable.append(t.url)
+
+    # Try common parameters on likely vulnerable pages (JSP/PHP/ASP)
+    COMMON_PARAMS = ["id", "query", "search", "user", "pass", "login", "name", "email", "q"]
+    for t in targets:
+        if any(t.url.endswith(ext) for ext in [".jsp", ".php", ".asp", ".aspx", ".do"]):
+            for param in COMMON_PARAMS:
+                url_with_param = t.url.rstrip("/") + "?" + param + "="
+                if url_with_param not in t.injectable:
+                    t.injectable.append(url_with_param)
 
     sqli_queue: list[str] = []
     for t in targets:
