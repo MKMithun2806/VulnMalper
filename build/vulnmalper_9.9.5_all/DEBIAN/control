@@ -1,0 +1,7 @@
+Package: vulnmalper
+Version: 9.9.5
+Section: utils
+Priority: optional
+Architecture: all
+Maintainer: Mithun <mkmithun2806@github>
+Description: High-performance recon tool with fixed httpx stdin support.
