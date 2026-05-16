@@ -1,2 +1,4 @@
 dist/
 .aider*
+.codex
+__pycache__
