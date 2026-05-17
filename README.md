@@ -7,6 +7,7 @@ Fingerprint → Scan → Verify, with every stage feeding the next.
 ```
 NetMalper JSON
     │
+    ├── phase 0    → service vulnerabilities (SSH/FTP/SMB/MySQL/...)
     ├── httpx        → all HTTP targets       (always — alive + tech)
     ├── whatweb      → all HTTP targets       (always — tech stack)
     ├── wafw00f      → all HTTP targets       (always — WAF detection)
@@ -83,6 +84,9 @@ vulnmalper example.json                      # scan  (VulnMalper)
 | `--runner docker` | Force Docker for every tool. |
 | `--only nuclei,wapiti` | Restrict to a subset of pipeline stages. |
 | `--severity medium` | Minimum severity kept from nuclei. |
+| `--auth-user USER --auth-pass PASS` | Enable authenticated scanning for supported tools. |
+| `--auth-cookie NAME=VALUE` | Use a session cookie for authenticated scanning. |
+| `--sqlmap-level N` / `--sqlmap-risk N` | Override sqlmap depth/risk defaults. |
 | `--threads 5` | Parallel target workers. |
 | `--max-targets 10` | Cap how many targets get scanned. |
 | `--out NAME` | Writes `NAME.md`. Default: `vulnmalper_<target>_<ts>.md`. |
@@ -91,8 +95,9 @@ vulnmalper example.json                      # scan  (VulnMalper)
 ## How smart dispatch works
 
 1. **Phase 1 — Fingerprint.** `httpx` probes liveness + tech on every URL. `whatweb` + `wafw00f` run in parallel on alive targets. Dead targets are dropped. WAF annotations are attached to each target.
-2. **Phase 2 — Scan.** `testssl.sh` runs on TLS ports (443/8443) only. `nikto` runs on classic web ports (80/443/8080/8443) only. `nuclei` + `wapiti` run on every alive HTTP target. Injection-flavored URLs surfaced by these tools get queued for phase 3.
-3. **Phase 3 — Verify.** `sqlmap` runs only against the curated queue — NetMalper's query-param endpoints + anything nuclei/nikto/wapiti surfaced as sqli/injection-tagged. No blind `?=` spraying.
+2. **Phase 1.5 — Crawl.** `gospider` discovers extra endpoints before fuzzing starts, then the new URLs are deduped and added to the phase 2 target pool.
+3. **Phase 2 — Scan.** `testssl.sh` runs on TLS ports (443/8443) only. `nikto` runs on classic web ports (80/443/8080/8443) only. `nuclei` + `wapiti` run on every alive HTTP target. Injection-flavored URLs surfaced by these tools get queued for phase 3.
+4. **Phase 3 — Verify.** `sqlmap` runs only against the curated queue — NetMalper's query-param endpoints + anything nuclei/nikto/wapiti surfaced as sqli/injection-tagged. No blind `?=` spraying.
 
 ## Building the .deb
 

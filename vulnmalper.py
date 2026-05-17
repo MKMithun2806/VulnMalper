@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import base64
+import csv
 import ipaddress
 import json
 import os
@@ -41,12 +43,13 @@ import tempfile
 import time
 import threading
 import urllib.parse
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-VERSION = "6.5.0"
+VERSION = "6.6.0"
 
 # Background warmup state for docker images and nuclei templates.
 DOCKER_IMAGE_EVENTS: dict[str, threading.Event] = {}
@@ -54,6 +57,12 @@ DOCKER_IMAGE_RESULTS: dict[str, bool] = {}
 NUCLEI_TEMPLATE_EVENT: Optional[threading.Event] = None
 NUCLEI_TEMPLATE_RESULT: Optional[bool] = None
 NUCLEI_TEMPLATE_LOCK = threading.RLock()
+PHASE0_NMAP_EVENT: Optional[threading.Event] = None
+PHASE0_NMAP_RESULT: Optional[bool] = None
+PHASE0_NMAP_LOCK = threading.RLock()
+CRAWLER_IMAGE_EVENT: Optional[threading.Event] = None
+CRAWLER_IMAGE_RESULT: Optional[bool] = None
+CRAWLER_IMAGE_LOCK = threading.RLock()
 
 # ── Stealth / polite-mode profile ───────────────────────────────────────────
 # Realistic, current desktop browser User-Agents. One is picked per run (or
@@ -210,6 +219,51 @@ class StealthProfile:
 # a module-global keeps the per-tool runner signatures backward compatible.
 STEALTH = StealthProfile()
 
+@dataclass
+class AuthProfile:
+    user: Optional[str] = None
+    password: Optional[str] = None
+    cookie: Optional[str] = None
+
+AUTH = AuthProfile()
+SQLMAP_LEVEL: Optional[int] = None
+SQLMAP_RISK: Optional[int] = None
+
+def auth_present() -> bool:
+    return bool((AUTH.user and AUTH.password) or AUTH.cookie)
+
+def auth_mode_label() -> str:
+    return "authenticated" if auth_present() else "unauthenticated"
+
+def auth_cookie_value() -> str:
+    return AUTH.cookie or ""
+
+def auth_basic_header() -> Optional[str]:
+    if not (AUTH.user and AUTH.password):
+        return None
+    raw = f"{AUTH.user}:{AUTH.password}".encode("utf-8")
+    token = base64.b64encode(raw).decode("ascii")
+    return f"Authorization: Basic {token}"
+
+def auth_form_data() -> str:
+    if not (AUTH.user and AUTH.password):
+        return ""
+    return f"username={urllib.parse.quote_plus(AUTH.user)}&password={urllib.parse.quote_plus(AUTH.password)}"
+
+def merge_form_data(*parts: str) -> str:
+    """Merge URL-encoded form/query strings without losing existing fields."""
+    items: list[tuple[str, str]] = []
+    for part in parts:
+        if not part:
+            continue
+        try:
+            items.extend(urllib.parse.parse_qsl(part, keep_blank_values=True))
+        except Exception:
+            continue
+    if not items:
+        return ""
+    return urllib.parse.urlencode(items, doseq=True)
+
 # ── Nuclei template hygiene ────────────────────────────────────────────────
 # Tags that are noisy, intrusive, or already covered by another stage in
 # this pipeline. Excluding them when --quiet (or --polite) is on cuts
@@ -308,6 +362,7 @@ class WebTarget:
     status:    Optional[int] = None
     tech:      list[str] = field(default_factory=list)
     waf:       Optional[str] = None
+    crawl_new_endpoints: int = 0
     # injectable URLs discovered by upstream tools (nikto/nuclei) during scan:
     injectable: list[str] = field(default_factory=list)
     # flag to avoid recursive discovery loops
@@ -316,6 +371,19 @@ class WebTarget:
     auto_strategy: Optional[str] = None
     auto_reason: str = ""
 
+@dataclass
+class ServiceTarget:
+    host:      str
+    port:      int
+    service:   str = ""
+    product:   str = ""
+    src_node:  str = ""
+    crawl_new_endpoints: int = 0
+
+    @property
+    def component(self) -> str:
+        return f"{self.host}:{self.port}"
+
 # ── NetMalper graph parsing ─────────────────────────────────────────────────
 WEB_SERVICES = {"http","https","http-proxy","https-alt","http-alt"}
 WEB_PORTS    = {80,81,443,591,2082,2083,2086,2087,2095,2096,
@@ -323,6 +391,7 @@ WEB_PORTS    = {80,81,443,591,2082,2083,2086,2087,2095,2096,
                 8090,8443,8888,9000,9001,9090,9443}
 NIKTO_PORTS  = {80,443,8080,8443}
 TLS_PORTS    = {443,8443}
+PHASE0_NMAP_IMAGE = "instrumentisto/nmap:latest"
 
 def _best_hostname_for_ip(ip: str, nodes: dict) -> Optional[str]:
     for n in nodes.values():
@@ -344,6 +413,7 @@ def parse_netmalper(graph: dict):
     nodes = {n["id"]: n for n in graph.get("nodes", [])}
     meta  = graph.get("meta", {})
     targets: dict[str, WebTarget] = {}
+    services: dict[tuple[str, int, str], ServiceTarget] = {}
 
     for n in nodes.values():
         if n["type"] != "endpoint": continue
@@ -377,7 +447,29 @@ def parse_netmalper(graph: dict):
             service=svc or scheme, product=d.get("product",""),
             src_node=n["id"],
         ))
-    return list(targets.values()), meta
+
+    for n in nodes.values():
+        if n["type"] != "port":
+            continue
+        d = n["data"]
+        port = d.get("port")
+        svc = (d.get("service") or "").lower()
+        host = d.get("host") or ""
+        if not host or not port:
+            continue
+        looks_web = svc in WEB_SERVICES or port in WEB_PORTS or "http" in svc
+        if looks_web:
+            continue
+        host_label = _best_hostname_for_ip(host, nodes) or host
+        key = (host_label, int(port), svc)
+        services.setdefault(key, ServiceTarget(
+            host=host_label,
+            port=int(port),
+            service=svc or "unknown",
+            product=d.get("product", ""),
+            src_node=n["id"],
+        ))
+    return list(targets.values()), list(services.values()), meta
 
 # ── Runner layer (local + docker) ───────────────────────────────────────────
 ALL_TOOLS = ["httpx","whatweb","wafw00f","testssl","nikto",
@@ -449,18 +541,20 @@ def plan_tools(runner_pref: str) -> dict[str, Optional[ToolPlan]]:
         out[name] = plan
     return out
 
-def ensure_docker_image(image: str):
+def ensure_docker_image(image: str, quiet: bool = False):
     try:
         subprocess.run(["docker","image","inspect",image],
                        capture_output=True, timeout=10, check=True)
         return True
     except subprocess.CalledProcessError:
-        log("info", f"Pulling docker image: {image}")
+        if not quiet:
+            log("info", f"Pulling docker image: {image}")
         try:
             subprocess.run(["docker","pull",image], timeout=600, check=True)
             return True
         except Exception as e:
-            log("err", f"docker pull {image} failed: {e}")
+            if not quiet:
+                log("err", f"docker pull {image} failed: {e}")
             return False
     except Exception:
         return False
@@ -547,6 +641,66 @@ def ensure_nuclei_templates(plan: Optional[ToolPlan]):
     event.wait()
     return bool(NUCLEI_TEMPLATE_RESULT)
 
+def warm_phase0_nmap_image():
+    """Background-pull the Phase 0 nmap image when Docker fallback is needed."""
+    global PHASE0_NMAP_EVENT
+    with PHASE0_NMAP_LOCK:
+        if PHASE0_NMAP_EVENT is not None:
+            return
+        event = threading.Event()
+        PHASE0_NMAP_EVENT = event
+
+        def _worker():
+            global PHASE0_NMAP_RESULT
+            try:
+                PHASE0_NMAP_RESULT = ensure_docker_image(PHASE0_NMAP_IMAGE)
+            except Exception:
+                PHASE0_NMAP_RESULT = False
+            finally:
+                event.set()
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+def wait_for_phase0_nmap_image() -> bool:
+    event = PHASE0_NMAP_EVENT
+    if event is None:
+        warm_phase0_nmap_image()
+        event = PHASE0_NMAP_EVENT
+    if event is None:
+        return False
+    event.wait()
+    return bool(PHASE0_NMAP_RESULT)
+
+def warm_crawler_image():
+    """Background-pull the gospider crawler image when crawling is enabled."""
+    global CRAWLER_IMAGE_EVENT
+    with CRAWLER_IMAGE_LOCK:
+        if CRAWLER_IMAGE_EVENT is not None:
+            return
+        event = threading.Event()
+        CRAWLER_IMAGE_EVENT = event
+
+        def _worker():
+            global CRAWLER_IMAGE_RESULT
+            try:
+                CRAWLER_IMAGE_RESULT = ensure_docker_image("jaeles-project/gospider", quiet=True)
+            except Exception:
+                CRAWLER_IMAGE_RESULT = False
+            finally:
+                event.set()
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+def wait_for_crawler_image() -> bool:
+    event = CRAWLER_IMAGE_EVENT
+    if event is None:
+        warm_crawler_image()
+        event = CRAWLER_IMAGE_EVENT
+    if event is None:
+        return False
+    event.wait()
+    return bool(CRAWLER_IMAGE_RESULT)
+
 def _run(cmd, timeout, stdin_data: Optional[str] = None):
     try:
         p = subprocess.run(cmd, input=stdin_data, capture_output=True,
@@ -598,6 +752,8 @@ def ensure_wordlist(name: str, url: str) -> str:
 # ────────────────────────────────────────────────────────────────────────────
 def run_httpx(targets: list[WebTarget], plan: ToolPlan, timeout: int):
     """Probe alive + fingerprint tech/server/status for every target."""
+    if not targets:
+        return []
     urls = "\n".join(t.url for t in targets)
     args = ["-silent","-json","-l","-","-nc","-no-color","-timeout","10",
             "-tech-detect","-status-code","-title","-server","-follow-redirects"]
@@ -836,6 +992,8 @@ def _nikto_capabilities(plan: ToolPlan) -> dict:
         "version_text":   (re.search(r"Nikto\s+v?([\d.]+)", help_text) or [None,"unknown"])[1],
         "add_header":     has("-Add-header"),
         "request_header": has("-RequestHeader"),  # legacy
+        "id_flag":        has("-id"),
+        "cookie_flag":    has("-cookie"),
         "useragent_flag": has("-useragent") or has("-Useragent"),
         "nointeractive":  has("-nointeractive"),
         "ask":            has("-ask"),
@@ -858,7 +1016,8 @@ def _nikto_capabilities(plan: ToolPlan) -> dict:
                      "maxtime": True, "tuning": True, "display": True,
                      "format_flag": True, "output_flag": True,
                      "host_flag": True, "ssl_flag": True, "port_flag": True,
-                     "root_flag": True, "pause": True, "useragent_flag": True})
+                     "root_flag": True, "pause": True, "useragent_flag": True,
+                     "id_flag": True, "cookie_flag": True})
     _NIKTO_CAPS_CACHE[key] = caps
     return caps
 
@@ -916,6 +1075,11 @@ def run_nikto(t: WebTarget, plan: ToolPlan, timeout: int):
         # absolute fallback — should never trigger, every nikto has -h
         args += [t.url]
 
+    if AUTH.user and AUTH.password and caps.get("id_flag"):
+        args += ["-id", f"{AUTH.user}:{AUTH.password}"]
+    if AUTH.cookie and caps.get("cookie_flag"):
+        args += ["-cookie", AUTH.cookie]
+
     if caps["ask"]:
         args += ["-ask", "no"]
     if caps["nointeractive"]:
@@ -925,8 +1089,13 @@ def run_nikto(t: WebTarget, plan: ToolPlan, timeout: int):
     # -Format derived from extension on every build, so we omit it.
     # It's safer NOT to pass -Format than to pass an unsupported value.
     if caps["maxtime"]:
-        # 2.6.0 wiki says "1h, 60m, 3600s" — bare seconds works on all builds.
-        maxtime = max(60, min(timeout - 30, 1800))
+        if STEALTH.slow:
+            maxtime = min(timeout, 570)
+        elif STEALTH.headless:
+            maxtime = min(timeout, 1200)
+        else:
+            maxtime = min(timeout, 900)
+        maxtime = max(60, maxtime)
         args += ["-maxtime", f"{maxtime}s"]
     if caps["tuning"]:
         # 1=interesting files, 2=misconfig, 3=info disclosure,
@@ -1048,8 +1217,16 @@ def run_nuclei(t: WebTarget, plan: ToolPlan, severity: str, timeout: int):
     rl = STEALTH.polite_rl(150)
     args = ["-u", t.url, "-jsonl","-silent","-nc",
             "-severity", ",".join(keep),
+            "-tags", "cves,exposures,misconfiguration,vulnerabilities,default-logins,takeovers",
+            "-exclude-tags", "fuzzing,dos,helpers",
+            "-stats",
             "-timeout","10","-rl",str(rl),
             "-H", f"User-Agent: {STEALTH.pick_ua()}"]
+    auth_hdr = auth_basic_header()
+    if auth_hdr:
+        args += ["-H", auth_hdr]
+    if auth_cookie_value():
+        args += ["-H", f"Cookie: {auth_cookie_value()}"]
     for h in STEALTH.default_headers():
         args += ["-H", h]
 
@@ -1085,9 +1262,8 @@ def run_nuclei(t: WebTarget, plan: ToolPlan, severity: str, timeout: int):
         args += ["-mhe", "10"]
 
     # ── Quiet template set: exclude noisy/intrusive tags + redundant globs.
-    # This is what cuts the "Nuclei default templates = 🚨 instant flag"
-    # signature: the request volume + URL paths are the actual fingerprint,
-    # not the headers. Excluding tech/ssl/dns/fuzz drops ~60-80% of probes.
+    # The curated tag list above is the primary filter; these are extra
+    # reductions when the user explicitly asked for quieter probing.
     if STEALTH.quiet or STEALTH.polite or STEALTH.slow:
         args += ["-etags", ",".join(NOISY_NUCLEI_TAGS)]
         for glob in NOISY_NUCLEI_TEMPLATE_GLOBS:
@@ -1162,6 +1338,11 @@ def run_wapiti(t: WebTarget, plan: ToolPlan, timeout: int):
         # Seed wapiti with API endpoints nuclei's headless run already found.
         for inj_url in t.injectable[:20]:
             extra += ["--start", inj_url]
+    extra += ["--module", "csrf,xss,sql,xxe,redirect,ssrf,timesql,blindsql,wapp,nikto,htaccess,cookieflags,csp,headers,http_headers"]
+    if AUTH.user and AUTH.password:
+        extra += ["--auth-credential", f"{AUTH.user}%{AUTH.password}", "--auth-method", "post"]
+    if AUTH.cookie:
+        extra += ["--cookie", AUTH.cookie]
     if plan.runner == "docker":
         container_dir = "/wrk"
         args = ["-u", t.url, "-f","json","-o", f"{container_dir}/{report}",
@@ -1294,6 +1475,209 @@ def run_ffuf(t: WebTarget, plan: ToolPlan, timeout: int) -> tuple[list[Finding],
         except Exception: pass
     shutil.rmtree(host_dir, ignore_errors=True)
     return findings, list(set(new_urls))
+
+SERVICE_SCAN_PLANS: dict[int, dict] = {
+    21:   {"service": "ftp",        "scheme": "ftp",         "nuclei_tags": ("ftp",),          "nmap_scripts": ("ftp-anon", "ftp-vuln*"), "nuclei": True,  "nmap": True},
+    22:   {"service": "ssh",        "scheme": "ssh",         "nuclei_tags": ("ssh",),          "nmap_scripts": (),                      "nuclei": True,  "nmap": False},
+    139:  {"service": "smb",        "scheme": "",            "nuclei_tags": (),                "nmap_scripts": ("smb-vuln*", "smb-enum-shares", "smb-enum-users"), "nuclei": False, "nmap": True},
+    445:  {"service": "smb",        "scheme": "",            "nuclei_tags": (),                "nmap_scripts": ("smb-vuln*", "smb-enum-shares", "smb-enum-users"), "nmap": True},
+    3306: {"service": "mysql",      "scheme": "mysql",       "nuclei_tags": ("mysql",),        "nmap_scripts": ("mysql-vuln*", "mysql-empty-password"), "nuclei": True,  "nmap": True},
+    5432: {"service": "postgresql", "scheme": "postgresql",  "nuclei_tags": ("postgresql",),   "nmap_scripts": ("pgsql-brute",), "nuclei": True,  "nmap": True},
+    6379: {"service": "redis",      "scheme": "redis",       "nuclei_tags": ("redis",),        "nmap_scripts": (),                      "nuclei": True,  "nmap": False},
+    27017: {"service": "mongodb",   "scheme": "mongodb",     "nuclei_tags": ("mongodb",),      "nmap_scripts": (),                      "nuclei": True,  "nmap": False},
+    3389: {"service": "rdp",        "scheme": "",            "nuclei_tags": (),                "nmap_scripts": ("rdp-vuln-ms12-020", "rdp-enum-encryption"), "nuclei": False, "nmap": True},
+    9200: {"service": "elasticsearch", "scheme": "http",    "nuclei_tags": ("elasticsearch",),"nmap_scripts": (),                      "nuclei": True,  "nmap": False},
+    2049: {"service": "nfs",        "scheme": "",            "nuclei_tags": (),                "nmap_scripts": ("nfs-showmount", "nfs-ls"), "nuclei": False, "nmap": True},
+    5900: {"service": "vnc",        "scheme": "vnc",         "nuclei_tags": ("vnc",),          "nmap_scripts": ("vnc-info", "vnc-brute"), "nuclei": True,  "nmap": True},
+}
+
+def _service_target_url(asset: ServiceTarget) -> str:
+    spec = SERVICE_SCAN_PLANS.get(asset.port, {})
+    scheme = spec.get("scheme") or (asset.service if asset.service in {"ssh", "ftp", "mysql", "postgresql", "redis", "mongodb", "vnc"} else "http")
+    if scheme == "http" and asset.port == 9200:
+        scheme = "http"
+    return f"{scheme}://{asset.host}:{asset.port}"
+
+def _service_scan_tags(asset: ServiceTarget) -> list[str]:
+    spec = SERVICE_SCAN_PLANS.get(asset.port, {})
+    return list(spec.get("nuclei_tags") or [])
+
+def _nmap_severity(script_id: str, output: str) -> str:
+    sid = (script_id or "").lower()
+    text = f"{script_id} {output}".lower()
+    if any(tok in sid for tok in ("vuln", "brute")):
+        return "high"
+    if any(tok in text for tok in ("empty password", "unauth", "unauthorized", "default credential")):
+        return "high"
+    if any(tok in sid for tok in ("enum", "info", "showmount", "ls")):
+        return "medium"
+    return "low"
+
+def _collect_json_urls(blob) -> list[str]:
+    urls: list[str] = []
+    if isinstance(blob, dict):
+        for key in ("url", "link", "href", "endpoint", "request", "source_url"):
+            val = blob.get(key)
+            if isinstance(val, str) and val.startswith(("http://", "https://")):
+                urls.append(val)
+        for value in blob.values():
+            urls.extend(_collect_json_urls(value))
+    elif isinstance(blob, list):
+        for item in blob:
+            urls.extend(_collect_json_urls(item))
+    elif isinstance(blob, str) and blob.startswith(("http://", "https://")):
+        urls.append(blob)
+    return urls
+
+def run_crawler(t: WebTarget, timeout: int) -> list[str]:
+    """Best-effort crawl with gospider via Docker. Silent on failure."""
+    if not have("docker"):
+        return []
+    if not wait_for_crawler_image():
+        return []
+    cmd = [
+        "docker", "run", "--rm", "--network", "host", "jaeles-project/gospider",
+        "-s", t.url, "-d", "3", "-c", "10", "--json",
+    ]
+    rc, out, err = _run(cmd, timeout)
+    if rc != 0 or not out:
+        return []
+    urls: list[str] = []
+    try:
+        blob = json.loads(out)
+        urls.extend(_collect_json_urls(blob))
+    except Exception:
+        pass
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            blob = json.loads(line)
+        except Exception:
+            try:
+                blob = json.loads(line.strip(","))
+            except Exception:
+                continue
+        urls.extend(_collect_json_urls(blob))
+    return urls
+
+def _normalize_discovered_url(u: str) -> str:
+    try:
+        return _normalize_url(u)
+    except Exception:
+        return u
+
+def run_nmap_nse(asset: ServiceTarget, scripts: tuple[str, ...], timeout: int) -> list[Finding]:
+    if not scripts:
+        return []
+    script_arg = ",".join(scripts)
+    local_nmap = have("nmap")
+    cmd: list[str]
+    if local_nmap:
+        cmd = ["nmap", "--script", script_arg, "-p", str(asset.port), asset.host, "-oX", "-"]
+    else:
+        if not have("docker"):
+            return []
+        if not wait_for_phase0_nmap_image():
+            return []
+        cmd = [
+            "docker", "run", "--rm", "--network", "host", PHASE0_NMAP_IMAGE,
+            "--script", script_arg, "-p", str(asset.port), asset.host, "-oX", "-",
+        ]
+    rc, out, err = _run(cmd, timeout)
+    if rc not in (0, 1) or not out.strip():
+        return []
+    findings: list[Finding] = []
+    try:
+        root = ET.fromstring(out)
+    except Exception:
+        return []
+    for host_el in root.findall("host"):
+        for port_el in host_el.findall("./ports/port"):
+            state_el = port_el.find("state")
+            if state_el is not None and (state_el.attrib.get("state") or "").lower() != "open":
+                continue
+            portid = port_el.attrib.get("portid") or str(asset.port)
+            for script_el in port_el.findall("script"):
+                sid = script_el.attrib.get("id") or "nmap-script"
+                output = script_el.attrib.get("output") or ""
+                if not output:
+                    parts = []
+                    for elem in script_el.iter():
+                        if elem is script_el:
+                            continue
+                        text = (elem.text or "").strip()
+                        if text:
+                            parts.append(text)
+                    output = "\n".join(parts)
+                findings.append(Finding(
+                    target=f"{asset.host}:{portid}",
+                    tool="nmap",
+                    severity=_nmap_severity(sid, output),
+                    title=sid,
+                    detail=output or f"NSE script {sid} reported on port {portid}",
+                    reference=f"nmap NSE: {sid}",
+                    raw={"script": sid, "port": portid, "service": asset.service},
+                ))
+    return findings
+
+def run_service_nuclei(asset: ServiceTarget, plan: ToolPlan, timeout: int) -> list[Finding]:
+    tags = _service_scan_tags(asset)
+    if not tags:
+        return []
+    rl = STEALTH.polite_rl(50)
+    url = _service_target_url(asset)
+    args = ["-u", url, "-jsonl", "-silent", "-nc",
+            "-tags", ",".join(tags),
+            "-exclude-tags", "fuzzing,dos,helpers",
+            "-stats",
+            "-timeout", "10", "-rl", str(rl),
+            "-H", f"User-Agent: {STEALTH.pick_ua()}"]
+    for h in STEALTH.default_headers():
+        args += ["-H", h]
+    if auth_basic_header():
+        args += ["-H", auth_basic_header()]
+    if auth_cookie_value():
+        args += ["-H", f"Cookie: {auth_cookie_value()}"]
+    cmd = build_cmd(plan, args)
+    rc, out, err = _run(cmd, timeout)
+    findings: list[Finding] = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            j = json.loads(line)
+        except Exception:
+            continue
+        info = j.get("info", {})
+        findings.append(Finding(
+            target=f"{asset.host}:{asset.port}",
+            tool="nuclei",
+            severity=(info.get("severity") or "unknown").lower(),
+            title=info.get("name") or j.get("template-id") or "nuclei finding",
+            detail=(info.get("description") or "").strip(),
+            reference=", ".join(info.get("reference") or []),
+            raw=j,
+        ))
+    return findings
+
+def run_phase0_service_scan(service_targets: list[ServiceTarget], plans: dict[str, Optional[ToolPlan]], timeout: int = 300) -> list[Finding]:
+    findings: list[Finding] = []
+    if not service_targets:
+        return findings
+    log("info", f"Service scan: {len(service_targets)} non-web service(s) queued")
+    if not have("nmap") and have("docker"):
+        warm_phase0_nmap_image()
+    service_plans = [s for s in service_targets if s.port in SERVICE_SCAN_PLANS]
+    for asset in service_plans:
+        spec = SERVICE_SCAN_PLANS.get(asset.port, {})
+        if spec.get("nuclei") and plans.get("nuclei"):
+            findings.extend(run_service_nuclei(asset, plans["nuclei"], timeout))
+        if spec.get("nmap"):
+            findings.extend(run_nmap_nse(asset, tuple(spec.get("nmap_scripts") or ()), timeout))
+    return findings
 
 # ────────────────────────────────────────────────────────────────────────────
 #  PHASE 2.5 — ACTIVE SERVICE CHAINING
@@ -1711,14 +2095,19 @@ def run_sqlmap(url: str, plan: ToolPlan, timeout: int, post_data: str = "", cook
     host_dir = f"/tmp/vulnmalper_sqlmap_{abs(hash(url))}"
     os.makedirs(host_dir, exist_ok=True)
     ua = STEALTH.pick_ua()
-    extra = ["--user-agent", ua]
+    stealth_sqlmap = STEALTH.polite or STEALTH.slow or STEALTH.quiet
+    level = SQLMAP_LEVEL if SQLMAP_LEVEL is not None else (1 if stealth_sqlmap else 3)
+    risk  = SQLMAP_RISK  if SQLMAP_RISK  is not None else (1 if stealth_sqlmap else 2)
+    extra = ["--user-agent", ua, "--level", str(level), "--risk", str(risk)]
 
     # sqlmap accepts a single --headers="K1: V1\nK2: V2" string
     hdrs = STEALTH.default_headers()
+    cookie_val = cookie or auth_cookie_value()
 
     # Add cookie header if provided
-    if cookie:
-        hdrs.append(f"Cookie: {cookie}")
+    if cookie_val:
+        extra += ["--cookie", cookie_val]
+        hdrs.append(f"Cookie: {cookie_val}")
 
     if hdrs:
         extra += ["--headers", "\n".join(hdrs)]
@@ -1739,11 +2128,15 @@ def run_sqlmap(url: str, plan: ToolPlan, timeout: int, post_data: str = "", cook
     extra += ["--tamper", ",".join(tamper_scripts)]
 
     # Random user-agent and other evasion headers
-    extra += ["--random-agent"]
+    extra += ["--random-agent", "--forms"]
 
-    # Add POST data if provided for form-based SQLi
-    if post_data:
-        extra += ["--data", post_data]
+    # Add POST data if provided for form-based SQLi, and merge auth creds
+    # into the same body when they are supplied.
+    form_data = post_data or ""
+    if AUTH.user and AUTH.password:
+        form_data = merge_form_data(form_data, auth_form_data())
+    if form_data:
+        extra += ["--data", form_data]
 
     # Blind SQLi specific: add time-delay for boolean-based detection
     if STEALTH.polite or STEALTH.slow:
@@ -1766,14 +2159,12 @@ def run_sqlmap(url: str, plan: ToolPlan, timeout: int, post_data: str = "", cook
 
     if plan.runner == "docker":
         container_dir = "/wrk"
-        args = ["-u", url, "--batch","--disable-coloring",
-                "--level","5","--risk","3","--smart",
+        args = ["-u", url, "--disable-coloring",
                 "--output-dir", container_dir,
                 "--timeout","30","--retries","3"] + extra
         cmd = build_cmd(plan, args, mount=(host_dir, container_dir))
     else:
-        args = ["-u", url, "--batch","--disable-coloring",
-                "--level","5","--risk","3","--smart",
+        args = ["-u", url, "--disable-coloring",
                 "--output-dir", host_dir,
                 "--timeout","30","--retries","3"] + extra
         cmd = build_cmd(plan, args)
@@ -1847,6 +2238,8 @@ def render_console(findings, targets, meta, duration, runner_map):
         if k in seen: continue
         seen.add(k); uniq.append(f)
     uniq.sort(key=lambda f: -SEV_ORDER.get(f.severity, 0))
+    service_findings = [f for f in uniq if _is_service_target_label(f.target)]
+    web_findings = [f for f in uniq if not _is_service_target_label(f.target)]
 
     counts, by_tool = {}, {}
     for f in uniq:
@@ -1857,7 +2250,10 @@ def render_console(findings, targets, meta, duration, runner_map):
     print(); print(line)
     print(f"  {C.B}{C.MG}VulnMalper Report{C.R}  ·  source: {C.CY}{meta.get('target','?')}{C.R}")
     print(line)
+    print(f"  Auth mode           : {C.B}{auth_mode_label()}{C.R}")
     print(f"  Web targets scanned : {C.B}{len(targets)}{C.R}")
+    if service_findings:
+        print(f"  Service findings    : {C.B}{len(service_findings)}{C.R}")
     print(f"  Total findings      : {C.B}{len(uniq)}{C.R}  (raw: {len(findings)})")
     print(f"  Duration            : {C.B}{duration:.1f}s{C.R}")
     print(f"  Tools used          : {C.B}{', '.join(by_tool) or 'none'}{C.R}")
@@ -1876,14 +2272,29 @@ def render_console(findings, targets, meta, duration, runner_map):
         if t.tech:  tags.append(f"tech=[{', '.join(t.tech[:4])}{'…' if len(t.tech)>4 else ''}]")
         if t.waf:   tags.append(f"{C.YL}WAF={t.waf}{C.R}")
         if t.injectable: tags.append(f"{C.MG}injectable×{len(t.injectable)}{C.R}")
+        tags.append(f"Crawl: {t.crawl_new_endpoints} new endpoints discovered")
         print(f"    {C.CY}{t.url:<55}{C.R}  " + " · ".join(tags))
     print(line)
 
-    if not uniq:
-        print(f"  {C.GN}No vulnerabilities detected. Clean run.{C.R}"); print(line); return
+    if service_findings:
+        print(f"  {C.B}Service Vulnerabilities{C.R}")
+        by_service: dict[str, list[Finding]] = {}
+        for f in service_findings:
+            by_service.setdefault(f.target, []).append(f)
+        for comp, fs in sorted(by_service.items(), key=lambda kv: (-max(SEV_ORDER.get(f.severity, 0) for f in kv[1]), kv[0])):
+            print(f"    {C.CY}{comp}{C.R} ({len(fs)})")
+            for f in sorted(fs, key=lambda f: (-SEV_ORDER.get(f.severity, 0), f.tool, f.title.lower()))[:8]:
+                print(f"      {SEV_BADGE[f.severity]} {C.DIM}[{f.tool}]{C.R} {f.title}")
+        print(line)
+
+    if not web_findings:
+        if not service_findings:
+            print(f"  {C.GN}No vulnerabilities detected. Clean run.{C.R}")
+        print(line)
+        return
 
     by_target: dict[str,list[Finding]] = {}
-    for f in uniq: by_target.setdefault(f.target.split("?")[0], []).append(f)
+    for f in web_findings: by_target.setdefault(f.target.split("?")[0], []).append(f)
     for tgt, fs in by_target.items():
         print()
         print(f"  {C.B}{C.CY}● {tgt}{C.R}  {C.GY}({len(fs)} findings){C.R}")
@@ -1916,6 +2327,9 @@ def _slug(s: str) -> str:
     s = re.sub(r"https?://", "", s)
     s = re.sub(r"[^A-Za-z0-9]+", "-", s).strip("-").lower()
     return s[:80] or "target"
+
+def _is_service_target_label(label: str) -> bool:
+    return bool(re.fullmatch(r"[^/]+:\d+", label or ""))
 
 def _md_escape(s: str) -> str:
     return (s or "").replace("|", "\\|").replace("\n", " ").strip()
@@ -2003,6 +2417,7 @@ def write_json_export(path, findings, targets, meta, duration, runner_map):
             "tech":          list(t.tech),
             "waf":           t.waf,
             "injectable":    list(t.injectable),
+            "crawl_new_endpoints": t.crawl_new_endpoints,
             "finding_count": len(host_fs),
             "by_severity":   host_sev,
             "findings":      [_f2dict(f) for f in sorted(
@@ -2017,6 +2432,7 @@ def write_json_export(path, findings, targets, meta, duration, runner_map):
             "generated_utc":  datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
             "source_target":  meta.get("target", "?"),
             "duration_s":     round(duration, 2),
+            "auth_mode":      auth_mode_label(),
             "runner_map":     runner_map,
             "totals": {
                 "findings": len(uniq),
@@ -2064,6 +2480,8 @@ def write_markdown(path, findings, targets, meta, duration, runner_map):
         f"`{k}`→{('🟢' if v=='local' else '🐳' if v=='docker' else '⚫')} {v}"
         for k,v in runner_map.items()
     )
+    service_findings = [f for f in findings if _is_service_target_label(f.target)]
+    web_findings = [f for f in findings if not _is_service_target_label(f.target)]
 
     L: list[str] = []
     # ── Header ────────────────────────────────────────────────────────────
@@ -2071,6 +2489,7 @@ def write_markdown(path, findings, targets, meta, duration, runner_map):
         f"# 🛡️  VulnMalper Report",
         "",
         f"> **Target:** `{target_name}` | **Generated:** {gen_iso} | **Engine:** VulnMalper v{VERSION}",
+        f"> **Auth mode:** `{auth_mode_label()}`",
         "",
         f"> {risk_label} | **{total}** findings across **{alive_n}/{len(targets)}** alive targets | scan took **{duration:.1f}s**",
         "",
@@ -2078,15 +2497,33 @@ def write_markdown(path, findings, targets, meta, duration, runner_map):
         "",
     ]
 
+    if service_findings:
+        by_service: dict[str, list[Finding]] = {}
+        for f in service_findings:
+            by_service.setdefault(f.target, []).append(f)
+        L += [
+            "## 🔧 Service Vulnerabilities",
+            "",
+            "| Component | Severity | Tool | Title |",
+            "|---|---|---|---|",
+        ]
+        for comp, fs in sorted(by_service.items(), key=lambda kv: (-max(SEV_ORDER.get(f.severity, 0) for f in kv[1]), kv[0])):
+            for f in sorted(fs, key=lambda f: (-SEV_ORDER.get(f.severity, 0), f.tool, f.title.lower())):
+                L.append(f"| `{comp}` | {_SEV_EMOJI.get(f.severity,'⚫')} **{f.severity.upper()}** | `{f.tool}` | {_md_escape(f.title)[:160]} |")
+        L += ["", "---", ""]
+
     # ── Table of contents ────────────────────────────────────────────────
     L += ["## 🧭 Table of Contents", ""]
-    L += [
+    toc_entries = [
         "- [Target Fingerprints](#-target-fingerprints)",
         "- [Findings](#-findings)",
         "- [Scan Metadata](#-scan-metadata)",
     ]
+    if service_findings:
+        toc_entries.insert(0, "- [Service Vulnerabilities](#-service-vulnerabilities)")
+    L += toc_entries
     by_target: dict[str,list[Finding]] = {}
-    for f in findings:
+    for f in web_findings:
         by_target.setdefault(f.target.split("?")[0], []).append(f)
     # stable ordering: targets with most-severe findings first
     def _max_sev(fs): return max((SEV_ORDER.get(f.severity,0) for f in fs), default=0)
@@ -2118,6 +2555,7 @@ def write_markdown(path, findings, targets, meta, duration, runner_map):
             f"| Detected Tech | {tech_str} |",
             f"| WAF | {waf_str} |",
             f"| Injectable Endpoints | {inj_str} |",
+            f"| Crawl | `{t.crawl_new_endpoints}` new endpoints discovered |",
             "",
             "</details>",
             "",
@@ -2125,8 +2563,9 @@ def write_markdown(path, findings, targets, meta, duration, runner_map):
 
     # ── Findings ─────────────────────────────────────────────────────────
     L += ["---", "", "## 🎯 Findings", ""]
-    if not findings:
-        L += ["_No findings reported by any tool._", ""]
+    if not web_findings:
+        if not service_findings:
+            L += ["_No findings reported by any tool._", ""]
     else:
         for tgt, fs in ordered_targets:
             fs.sort(key=lambda f: (-SEV_ORDER.get(f.severity, 0), f.tool, f.title.lower()))
@@ -2227,6 +2666,13 @@ def main():
     ap.add_argument("--sqlmap-timeout",   type=int, default=900)
     ap.add_argument("--ffuf-timeout",     type=int, default=600)
     ap.add_argument("--feroxbuster-timeout", type=int, default=900)
+    ap.add_argument("--sqlmap-level", type=int, default=None,
+                    help="Override sqlmap --level (default: 3 normal, 1 stealth)")
+    ap.add_argument("--sqlmap-risk", type=int, default=None,
+                    help="Override sqlmap --risk (default: 2 normal, 1 stealth)")
+    ap.add_argument("--auth-user", default=None, help="Username for authenticated scanning.")
+    ap.add_argument("--auth-pass", default=None, help="Password for authenticated scanning.")
+    ap.add_argument("--auth-cookie", default=None, help='Session cookie in "NAME=VALUE" form.')
 
     # ── Stealth / polite-mode flags ─────────────────────────────────────
     sg = ap.add_argument_group("stealth / polite-mode",
@@ -2289,7 +2735,7 @@ def main():
     args = ap.parse_args()
 
     # Activate the stealth profile BEFORE any tool runs.
-    global STEALTH
+    global STEALTH, AUTH, SQLMAP_LEVEL, SQLMAP_RISK
     STEALTH = StealthProfile(
         polite     = args.polite or args.slow,
         slow       = args.slow,
@@ -2301,6 +2747,9 @@ def main():
         jitter     = not args.no_jitter,
         quiet      = args.quiet or args.polite or args.slow,
     )
+    AUTH = AuthProfile(user=args.auth_user, password=args.auth_pass, cookie=args.auth_cookie)
+    SQLMAP_LEVEL = args.sqlmap_level
+    SQLMAP_RISK = args.sqlmap_risk
 
     banner()
     # Surface the active stealth profile so the user knows what's on.
@@ -2346,11 +2795,13 @@ def main():
     except Exception as e:
         log("err", f"Failed to read NetMalper JSON: {e}"); sys.exit(2)
 
-    targets, meta = parse_netmalper(graph)
+    targets, service_targets, meta = parse_netmalper(graph)
     log("info", f"Loaded NetMalper graph for {C.B}{meta.get('target','?')}{C.R} "
                 f"({len(graph.get('nodes',[]))} nodes)")
-    if not targets:
-        log("warn", "No web targets discovered. Nothing to scan."); sys.exit(0)
+    if not targets and not service_targets:
+        log("warn", "No scan targets discovered. Nothing to scan."); sys.exit(0)
+    if not targets and service_targets:
+        log("info", f"Web targets absent, but {len(service_targets)} service target(s) found for Phase 0")
     if args.max_targets and len(targets) > args.max_targets:
         log("warn", f"Capping {len(targets)} → {args.max_targets} targets")
         targets = targets[:args.max_targets]
@@ -2377,6 +2828,10 @@ def main():
     log("info", "Warming docker images in background where needed")
     warm_docker_images(plans)
     warm_nuclei_templates(plans["nuclei"])
+    if targets:
+        warm_crawler_image()
+    if service_targets and not have("nmap") and have("docker"):
+        warm_phase0_nmap_image()
     runner_map = {k: (v.runner if v else "off") for k, v in plans.items()}
 
     timeouts = {
@@ -2425,6 +2880,12 @@ def main():
                         f"→ {secs}s ({secs//60}min) each")
 
     all_findings: list[Finding] = []
+    if service_targets:
+        _phase("Phase 0 — Service Vulnerability Scanning")
+        log("info", f"🔧 Service scan — {len(service_targets)} non-web services found")
+        service_findings = run_phase0_service_scan(service_targets, plans, timeout=300)
+        all_findings.extend(service_findings)
+
     t0 = time.time()
 
     # ── PHASE 1: fingerprint ───────────────────────────────────────────────
@@ -2476,12 +2937,71 @@ def main():
                     for fs in ex.map(_fp_worker, revived_targets):
                         all_findings.extend(fs)
 
-    # ── PHASE 1.5: discovery ───────────────────────────────────────────────
+    # ── PHASE 1.5: crawl + discovery ──────────────────────────────────────
+    DISCOVERY_TECHS = {"api", "rest", "node.js", "php", "asp.net", "java",
+                       "python", "go", "ruby", "django", "flask", "laravel", "express"}
+    alive_for_discovery = [t for t in targets if t.alive and not t.discovered]
+    if alive_for_discovery:
+        crawl_candidates = [t for t in alive_for_discovery
+                            if any(dt in " ".join(t.tech).lower() for dt in DISCOVERY_TECHS)
+                            or t.status in (200, 403)]
+    else:
+        crawl_candidates = []
+
+    if crawl_candidates:
+        _phase("Phase 1.5 — Crawl discovery (gospider)")
+        discovered_targets: list[WebTarget] = []
+        existing_urls = {_normalize_discovered_url(t.url) for t in targets}
+
+        def _register_discovered_urls(source: WebTarget, urls: list[str]) -> list[WebTarget]:
+            new_targets: list[WebTarget] = []
+            for u in urls:
+                normalized_url = _normalize_discovered_url(u)
+                if not normalized_url or normalized_url in existing_urls:
+                    continue
+                existing_urls.add(normalized_url)
+                p = urllib.parse.urlparse(normalized_url)
+                new_targets.append(WebTarget(
+                    url=normalized_url,
+                    host=p.hostname or "",
+                    port=p.port or (443 if p.scheme == "https" else 80),
+                    scheme=p.scheme,
+                    alive=True,
+                    discovered=True,
+                ))
+            source.crawl_new_endpoints += len(new_targets)
+            return new_targets
+
+        def _crawl_worker(t: WebTarget):
+            if auto_mode:
+                strategy, reason = _ensure_auto_strategy(t)
+                if strategy == "stealth":
+                    log("skip", f"crawl → {t.url} skipped in auto stealth mode ({reason})")
+                    return []
+            urls = run_crawler(t, min(timeouts["feroxbuster"], 600))
+            if not urls:
+                return []
+            log("run", f"gospider crawl → {t.url} ({len(urls)} raw url(s))")
+            return _register_discovered_urls(t, urls)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as ex:
+            for new_targets in ex.map(_crawl_worker, crawl_candidates):
+                discovered_targets.extend(new_targets)
+
+        if discovered_targets:
+            log("ok", f"Discovered {len(discovered_targets)} crawl endpoint(s); fingerprinting new targets")
+            targets.extend(discovered_targets)
+            if plans["httpx"]:
+                log("run", f"httpx fingerprinting {len(discovered_targets)} crawled target(s)")
+                fs = run_httpx(discovered_targets, plans["httpx"], timeouts["httpx"])
+                all_findings.extend(fs)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as ex:
+                for fs in ex.map(_fp_worker, discovered_targets):
+                    all_findings.extend(fs)
+
     discovery_enabled = plans["ffuf"] or plans["feroxbuster"]
     if discovery_enabled:
         _phase("Phase 1.5 — Discovery (feroxbuster, ffuf)")
-        DISCOVERY_TECHS = {"api", "rest", "node.js", "php", "asp.net", "java", 
-                           "python", "go", "ruby", "django", "flask", "laravel", "express"}
         discovered_targets = []
         
         def _discovery_worker(t: WebTarget):
@@ -2537,14 +3057,15 @@ def main():
                     discovered_targets.extend(results)
         
         if discovered_targets:
-            # Dedupe discovered targets using composite key (host:port:scheme)
-            unique_new = {}
+            seen_urls = {_normalize_discovered_url(t.url) for t in targets}
+            unique_new: dict[str, WebTarget] = {}
             for nt in discovered_targets:
-                # Composite key for better deduplication
-                comp_key = f"{nt.host}:{nt.port}:{nt.scheme}"
-                if comp_key not in unique_new and nt.url not in [t.url for t in targets]:
-                    unique_new[comp_key] = nt
-            
+                normalized_url = _normalize_discovered_url(nt.url)
+                if not normalized_url or normalized_url in seen_urls:
+                    continue
+                seen_urls.add(normalized_url)
+                unique_new[normalized_url] = nt
+
             new_list = list(unique_new.values())
             if new_list:
                 log("ok", f"Discovered {len(new_list)} new targets! Adding to full stack scan pool.")
