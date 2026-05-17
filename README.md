@@ -103,7 +103,7 @@ vulnmalper example.json                      # scan  (VulnMalper)
 
 ```bash
 ./build_deb.sh                # reads VERSION from vulnmalper.py
-./build_deb.sh 2.2.0          # override version
+./build_deb.sh 7.0.0          # override version
 # → dist/vulnmalper_<version>_all.deb
 ```
 
