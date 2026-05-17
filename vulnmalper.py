@@ -1537,7 +1537,7 @@ def run_crawler(t: WebTarget, timeout: int) -> list[str]:
         return []
     cmd = [
         "docker", "run", "--rm", "--network", "host", "jaeles-project/gospider",
-        "-s", t.url, "-d", "3", "-c", "10", "--json",
+        "-s", t.url, "-d", "3", "-c", "10", "--json", "-a", STEALTH.pick_ua(),
     ]
     rc, out, err = _run(cmd, timeout)
     if rc != 0 or not out:
@@ -2127,8 +2127,10 @@ def run_sqlmap(url: str, plan: ToolPlan, timeout: int, post_data: str = "", cook
     ]
     extra += ["--tamper", ",".join(tamper_scripts)]
 
-    # Random user-agent and other evasion headers
-    extra += ["--random-agent", "--forms"]
+    # PROJECT-WIDE EVASION: Use our pinned UA and other evasion headers
+    # We explicitly EXCLUDE --random-agent because it would override our 
+    # chosen UA with sqlmap's own internal (often outdated) pool.
+    extra += ["--forms"]
 
     # Add POST data if provided for form-based SQLi, and merge auth creds
     # into the same body when they are supplied.
@@ -3277,4 +3279,12 @@ def main():
             log("err", f"JSON export failed: {e}")
 
 if __name__ == "__main__":
+    main()
+      log("err", f"JSON export failed: {e}")
+
+if __name__ == "__main__":
+    main()
+__ == "__main__":
+    main()
+:
     main()
