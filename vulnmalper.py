@@ -3280,11 +3280,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-      log("err", f"JSON export failed: {e}")
-
-if __name__ == "__main__":
-    main()
-__ == "__main__":
-    main()
-:
-    main()
