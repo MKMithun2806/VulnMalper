@@ -473,7 +473,7 @@ def parse_netmalper(graph: dict):
 
 # ── Runner layer (local + docker) ───────────────────────────────────────────
 ALL_TOOLS = ["httpx","whatweb","wafw00f","testssl","nikto",
-             "nuclei","wapiti","sqlmap","ffuf","feroxbuster"]
+             "nuclei","wapiti","sqlmap","ffuf","feroxbuster", "gospider"]
 
 DOCKER_IMAGES = {
     "httpx":   "projectdiscovery/httpx:latest",
@@ -486,6 +486,7 @@ DOCKER_IMAGES = {
     "sqlmap":  "googlesky/sqlmap:latest",
     "ffuf":    "secsi/ffuf:latest",
     "feroxbuster": "epi052/feroxbuster",
+    "gospider": "jaeles-project/gospider:latest",
 }
 # Some tools publish their binary under a different name inside the image:
 DOCKER_ENTRYPOINTS = {
@@ -503,6 +504,7 @@ LOCAL_BINARIES = {
     "sqlmap":  "sqlmap",
     "ffuf":    "ffuf",
     "feroxbuster": "feroxbuster",
+    "gospider": "gospider",
 }
 
 def have(cmd: str) -> bool:
@@ -673,33 +675,14 @@ def wait_for_phase0_nmap_image() -> bool:
 
 def warm_crawler_image():
     """Background-pull the gospider crawler image when crawling is enabled."""
-    global CRAWLER_IMAGE_EVENT
-    with CRAWLER_IMAGE_LOCK:
-        if CRAWLER_IMAGE_EVENT is not None:
-            return
-        event = threading.Event()
-        CRAWLER_IMAGE_EVENT = event
-
-        def _worker():
-            global CRAWLER_IMAGE_RESULT
-            try:
-                CRAWLER_IMAGE_RESULT = ensure_docker_image("jaeles-project/gospider", quiet=True)
-            except Exception:
-                CRAWLER_IMAGE_RESULT = False
-            finally:
-                event.set()
-
-        threading.Thread(target=_worker, daemon=True).start()
+    # Note: gospider is now in ALL_TOOLS and handled by warm_docker_images(plans).
+    # This legacy helper is kept as a no-op to avoid breaking other callsites
+    # if any remain, but the heavy lifting is moved to the central warm_docker_images.
+    pass
 
 def wait_for_crawler_image() -> bool:
-    event = CRAWLER_IMAGE_EVENT
-    if event is None:
-        warm_crawler_image()
-        event = CRAWLER_IMAGE_EVENT
-    if event is None:
-        return False
-    event.wait()
-    return bool(CRAWLER_IMAGE_RESULT)
+    # Legacy wrapper, no longer strictly needed but kept for compatibility.
+    return True
 
 def _run(cmd, timeout, stdin_data: Optional[str] = None):
     try:
@@ -1529,25 +1512,23 @@ def _collect_json_urls(blob) -> list[str]:
         urls.append(blob)
     return urls
 
-def run_crawler(t: WebTarget, timeout: int) -> list[str]:
-    """Best-effort crawl with gospider via Docker. Silent on failure."""
-    if not have("docker"):
+def run_crawler(t: WebTarget, plan: Optional[ToolPlan], timeout: int) -> list[str]:
+    """Best-effort crawl with gospider. Supports local or docker via ToolPlan."""
+    if not plan:
         return []
-    if not wait_for_crawler_image():
-        return []
-    cmd = [
-        "docker", "run", "--rm", "--network", "host", "jaeles-project/gospider",
-        "-s", t.url, "-d", "3", "-c", "10", "--json", "-a", STEALTH.pick_ua(),
-    ]
+    args = ["-s", t.url, "-d", "3", "-c", "10", "--json", "-a", STEALTH.pick_ua()]
+    cmd = build_cmd(plan, args)
     rc, out, err = _run(cmd, timeout)
     if rc != 0 or not out:
         return []
     urls: list[str] = []
+    # Try parsing whole output as JSON array
     try:
         blob = json.loads(out)
         urls.extend(_collect_json_urls(blob))
     except Exception:
         pass
+    # Also try line-by-line (NDJSON)
     for line in out.splitlines():
         line = line.strip()
         if not line:
@@ -1560,7 +1541,7 @@ def run_crawler(t: WebTarget, timeout: int) -> list[str]:
             except Exception:
                 continue
         urls.extend(_collect_json_urls(blob))
-    return urls
+    return list(set(urls))
 
 def _normalize_discovered_url(u: str) -> str:
     try:
@@ -2980,7 +2961,7 @@ def main():
                 if strategy == "stealth":
                     log("skip", f"crawl → {t.url} skipped in auto stealth mode ({reason})")
                     return []
-            urls = run_crawler(t, min(timeouts["feroxbuster"], 600))
+            urls = run_crawler(t, plans.get("gospider"), min(timeouts.get("gospider", 600), 600))
             if not urls:
                 return []
             log("run", f"gospider crawl → {t.url} ({len(urls)} raw url(s))")
