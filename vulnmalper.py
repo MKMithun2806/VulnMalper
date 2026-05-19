@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VulnMalper v7.0.0  —  Vulnerability pipeline for NetMalper graphs.
+VulnMalper v7.1.2  —  Vulnerability pipeline for NetMalper graphs.
 
 Pipeline:
     NetMalper JSON
@@ -49,7 +49,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-VERSION = "7.0.0"
+VERSION = "7.1.2"
 
 # Background warmup state for docker images and nuclei templates.
 DOCKER_IMAGE_EVENTS: dict[str, threading.Event] = {}
@@ -486,7 +486,7 @@ DOCKER_IMAGES = {
     "sqlmap":  "googlesky/sqlmap:latest",
     "ffuf":    "secsi/ffuf:latest",
     "feroxbuster": "epi052/feroxbuster",
-    "gospider": "jaeles-project/gospider:latest",
+    "gospider": "bormaa/b-hunters-gospider",
 }
 # Some tools publish their binary under a different name inside the image:
 DOCKER_ENTRYPOINTS = {
