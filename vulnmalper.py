@@ -49,7 +49,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-VERSION = "7.1.2"
+VERSION = "7.1.3"
 
 # Background warmup state for docker images and nuclei templates.
 DOCKER_IMAGE_EVENTS: dict[str, threading.Event] = {}
@@ -1198,10 +1198,8 @@ def run_nuclei(t: WebTarget, plan: ToolPlan, severity: str, timeout: int):
     sev_chain = ["info","low","medium","high","critical"]
     keep = sev_chain[max(0, sev_chain.index(severity)):] if severity in sev_chain else sev_chain
     rl = STEALTH.polite_rl(150)
-    tags = "cves,exposures,misconfiguration,vulnerabilities,default-logins,takeovers"
     args = ["-u", t.url, "-jsonl","-silent","-nc",
             "-severity", ",".join(keep),
-            "-tags", tags,
             "-exclude-tags", "fuzzing,dos,helpers",
             "-stats",
             "-timeout","10","-rl",str(rl),
@@ -1266,7 +1264,7 @@ def run_nuclei(t: WebTarget, plan: ToolPlan, severity: str, timeout: int):
 
     # Debug: log nuclei configuration visibility as requested
     log("info", f"[*] nuclei profile:")
-    log("info", f"    tags={tags}")
+    log("info", f"    tags=none (all templates)")
     log("info", f"    severity={','.join(keep)}")
     log("info", f"    timeout=10")
     log("info", f"    rl={rl}")
