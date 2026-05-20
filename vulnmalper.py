@@ -1198,9 +1198,10 @@ def run_nuclei(t: WebTarget, plan: ToolPlan, severity: str, timeout: int):
     sev_chain = ["info","low","medium","high","critical"]
     keep = sev_chain[max(0, sev_chain.index(severity)):] if severity in sev_chain else sev_chain
     rl = STEALTH.polite_rl(150)
+    tags = "cves,exposures,misconfiguration,vulnerabilities,default-logins,takeovers"
     args = ["-u", t.url, "-jsonl","-silent","-nc",
             "-severity", ",".join(keep),
-            "-tags", "cves,exposures,misconfiguration,vulnerabilities,default-logins,takeovers",
+            "-tags", tags,
             "-exclude-tags", "fuzzing,dos,helpers",
             "-stats",
             "-timeout","10","-rl",str(rl),
@@ -1227,7 +1228,9 @@ def run_nuclei(t: WebTarget, plan: ToolPlan, severity: str, timeout: int):
             os.makedirs(template_dir, exist_ok=True)
 
         nuclei_mount = (template_dir, "/root/nuclei-templates")
-        ensure_nuclei_templates(plan)
+        ok = ensure_nuclei_templates(plan)
+        if not ok:
+            log("warn", "nuclei: template update was incomplete/failed, using existing or default set")
 
     # ── Stealth: smaller, smarter probing under --polite / --slow / --quiet
     # Default nuclei = 25 templates × 25 hosts in parallel = obvious burst.
@@ -1260,20 +1263,43 @@ def run_nuclei(t: WebTarget, plan: ToolPlan, severity: str, timeout: int):
         # nuclei refuses headless+host-network unless you also pass these:
         if plan.runner == "docker":
             args += ["-system-chrome"]
+
+    # Debug: log nuclei configuration visibility as requested
+    log("info", f"[*] nuclei profile:")
+    log("info", f"    tags={tags}")
+    log("info", f"    severity={','.join(keep)}")
+    log("info", f"    timeout=10")
+    log("info", f"    rl={rl}")
+
     cmd = build_cmd(plan, args, mount=nuclei_mount)
     rc, out, err = _run(cmd, timeout)
     findings: list[Finding] = []
     INJ_TAGS = {"sqli","sql-injection","injection","xss","ssti","lfi","rfi"}
     
-    # Debug: log nuclei output stats
-    if out:
-        lines = out.strip().splitlines()
-        json_lines = [l for l in lines if l.startswith("{")]
-        log("info", f"nuclei: got {len(json_lines)} JSON results from {t.url}")
+    # ── Output logic fix ───────────────────────────────────────────────
+    # Distinguish between 0 findings (rc=0, empty out) and failure (rc!=0)
+    if rc == 0:
+        if out:
+            lines = out.strip().splitlines()
+            json_lines = [l for l in lines if l.startswith("{")]
+            log("info", f"nuclei: got {len(json_lines)} JSON results from {t.url}")
+        else:
+            log("info", f"nuclei completed successfully (0 findings) for {t.url}")
+            # If stderr contains stats, log them as INFO instead of WARN
+            if err:
+                stats = []
+                for line in err.splitlines():
+                    line = line.strip()
+                    if any(x in line.lower() for x in ["templates", "requests", "matched", "duration"]):
+                        stats.append(line)
+                if stats:
+                    log("info", f"    {' | '.join(stats)}")
     else:
-        log("warn", f"nuclei: no output for {t.url} (rc={rc})")
+        log("warn", f"nuclei failed rc={rc} for {t.url}")
         if err:
-            log("warn", f"nuclei stderr: {err[:500]}")
+            # Only log the last few lines or interesting error bits
+            log("warn", f"nuclei stderr: {err.strip().splitlines()[-1] if err.strip() else 'no output'}")
+
     for line in out.splitlines():
         line = line.strip()
         if not line.startswith("{"): continue
@@ -1281,7 +1307,7 @@ def run_nuclei(t: WebTarget, plan: ToolPlan, severity: str, timeout: int):
         except Exception: continue
         info = j.get("info", {})
         sev  = (info.get("severity") or "unknown").lower()
-        tags = set(info.get("tags") or [])
+        tags_found = set(info.get("tags") or [])
         matched = j.get("matched-at") or t.url
         findings.append(Finding(
             target=matched, tool="nuclei", severity=sev,
@@ -1291,10 +1317,8 @@ def run_nuclei(t: WebTarget, plan: ToolPlan, severity: str, timeout: int):
             raw=j,
         ))
         # Feed sqlmap when nuclei points at an injection-flavored URL w/ params.
-        if (tags & INJ_TAGS) and "?" in matched and matched not in t.injectable:
+        if (tags_found & INJ_TAGS) and "?" in matched and matched not in t.injectable:
             t.injectable.append(matched)
-    if rc != 0 and not findings and err:
-        log("warn", f"nuclei: {err.strip().splitlines()[-1] if err.strip() else 'no output'}")
     return findings
 
 WAPITI_SEV_MAP = {1:"low",2:"medium",3:"high",4:"critical",0:"info",
