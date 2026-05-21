@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VulnMalper v7.1.4  —  Vulnerability pipeline for NetMalper graphs.
+VulnMalper v7.1.5  —  Vulnerability pipeline for NetMalper graphs.
 
 Pipeline:
     NetMalper JSON
@@ -49,7 +49,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-VERSION = "7.1.4"
+VERSION = "7.1.5"
 
 # Background warmup state for docker images and nuclei templates.
 DOCKER_IMAGE_EVENTS: dict[str, threading.Event] = {}
@@ -1666,7 +1666,7 @@ def run_service_nuclei(asset: ServiceTarget, plan: ToolPlan, timeout: int) -> li
         ))
     return findings
 
-def run_phase0_service_scan(service_targets: list[ServiceTarget], plans: dict[str, Optional[ToolPlan]], timeout: int = 300) -> list[Finding]:
+def run_phase0_service_scan(service_targets: list[ServiceTarget], plans: dict[str, Optional[ToolPlan]], timeout: int = 300, nuclei_timeout: Optional[int] = 300) -> list[Finding]:
     findings: list[Finding] = []
     if not service_targets:
         return findings
@@ -1677,7 +1677,7 @@ def run_phase0_service_scan(service_targets: list[ServiceTarget], plans: dict[st
     for asset in service_plans:
         spec = SERVICE_SCAN_PLANS.get(asset.port, {})
         if spec.get("nuclei") and plans.get("nuclei"):
-            findings.extend(run_service_nuclei(asset, plans["nuclei"], timeout))
+            findings.extend(run_service_nuclei(asset, plans["nuclei"], nuclei_timeout))
         if spec.get("nmap"):
             findings.extend(run_nmap_nse(asset, tuple(spec.get("nmap_scripts") or ()), timeout))
     return findings
@@ -2729,6 +2729,10 @@ def main():
              "Valid tool names: httpx, whatweb, wafw00f, testssl, nikto, "
              "nuclei, wapiti, sqlmap, ffuf, feroxbuster.")
 
+    ap.add_argument("--addtimeout", action="store_true",
+        help="Enable process-level timeout for nuclei (uses --nuclei-timeout, default 600s). "
+             "By default, nuclei runs without a process-level timeout.")
+
     # ── JSON export flag ───────────────────────────────────────────────
     ap.add_argument("--export-json", nargs="?", const="__AUTO__", default=None,
         metavar="PATH",
@@ -2842,7 +2846,7 @@ def main():
     timeouts = {
         "httpx": args.httpx_timeout, "whatweb": args.whatweb_timeout,
         "wafw00f": args.wafw00f_timeout, "testssl": args.testssl_timeout,
-        "nikto": args.nikto_timeout, "nuclei": args.nuclei_timeout,
+        "nikto": args.nikto_timeout, "nuclei": args.nuclei_timeout if args.addtimeout else None,
         "wapiti": args.wapiti_timeout, "sqlmap": args.sqlmap_timeout,
         "ffuf": args.ffuf_timeout, "feroxbuster": args.feroxbuster_timeout,
     }
@@ -2888,7 +2892,7 @@ def main():
     if service_targets:
         _phase("Phase 0 — Service Vulnerability Scanning")
         log("info", f"🔧 Service scan — {len(service_targets)} non-web services found")
-        service_findings = run_phase0_service_scan(service_targets, plans, timeout=300)
+        service_findings = run_phase0_service_scan(service_targets, plans, timeout=300, nuclei_timeout=timeouts["nuclei"])
         all_findings.extend(service_findings)
 
     t0 = time.time()
