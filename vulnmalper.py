@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VulnMalper v7.1.5  —  Vulnerability pipeline for NetMalper graphs.
+VulnMalper v7.1.6  —  Vulnerability pipeline for NetMalper graphs.
 
 Pipeline:
     NetMalper JSON
@@ -49,7 +49,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-VERSION = "7.1.5"
+VERSION = "7.1.6"
 
 # Background warmup state for docker images and nuclei templates.
 DOCKER_IMAGE_EVENTS: dict[str, threading.Event] = {}
@@ -404,9 +404,9 @@ def _best_hostname_for_ip(ip: str, nodes: dict) -> Optional[str]:
     return None
 
 def _normalize_url(url: str) -> str:
-    """Normalize URL by removing trailing slashes and ensuring consistent format."""
+    """Normalize URL by ensuring consistent format without forcing slash stripping."""
     p = urllib.parse.urlparse(url)
-    path = p.path.rstrip("/") or "/"
+    path = p.path or "/"
     return urllib.parse.urlunparse((p.scheme, p.netloc, path, p.params, p.query, p.fragment))
 
 def parse_netmalper(graph: dict):
@@ -419,7 +419,7 @@ def parse_netmalper(graph: dict):
         if n["type"] != "endpoint": continue
         url = n["data"].get("url")
         if not url: continue
-        # Normalize URL to remove trailing slashes
+        # Normalize URL while preserving trailing slashes if present
         normalized_url = _normalize_url(url)
         p = urllib.parse.urlparse(normalized_url)
         port = p.port or (443 if p.scheme == "https" else 80)
@@ -439,7 +439,7 @@ def parse_netmalper(graph: dict):
         scheme = "https" if (svc == "https" or port in (443,8443,9443)) else "http"
         host_label = _best_hostname_for_ip(host, nodes) or host
         url = f"{scheme}://{host_label}" + (f":{port}" if port not in (80,443) else "") + "/"
-        # Normalize URL to remove trailing slashes
+        # Normalize URL while preserving trailing slashes if present
         normalized_url = _normalize_url(url)
         p = urllib.parse.urlparse(normalized_url)
         targets.setdefault(normalized_url, WebTarget(
@@ -1406,7 +1406,7 @@ def run_feroxbuster(t: WebTarget, plan: ToolPlan, timeout: int) -> tuple[list[Fi
     os.makedirs(host_dir, exist_ok=True)
     report = "ferox.txt"
     
-    args = ["-u", t.url, "-w", "/wl/wl.txt" if plan.runner == "docker" else wl_path,
+    args = ["-u", t.url, "-w", f"/wl/{os.path.basename(wl_path)}" if plan.runner == "docker" else wl_path,
             "-d", "2", "--silent", "-o", f"/wrk/{report}" if plan.runner == "docker" else os.path.join(host_dir, report)]
     
     if plan.runner == "docker":
@@ -1448,7 +1448,7 @@ def run_ffuf(t: WebTarget, plan: ToolPlan, timeout: int) -> tuple[list[Finding],
     report = "ffuf.json"
 
     target_url = t.url.rstrip("/") + "/FUZZ"
-    args = ["-u", target_url, "-w", "/wl/wl.txt" if plan.runner == "docker" else wl_path,
+    args = ["-u", target_url, "-w", f"/wl/{os.path.basename(wl_path)}" if plan.runner == "docker" else wl_path,
             "-mc", "200", "-of", "json", "-o", f"/wrk/{report}" if plan.runner == "docker" else os.path.join(host_dir, report),
             "-s"]
     
@@ -1538,7 +1538,7 @@ def run_crawler(t: WebTarget, plan: Optional[ToolPlan], timeout: int) -> list[st
     """Best-effort crawl with gospider. Supports local or docker via ToolPlan."""
     if not plan:
         return []
-    args = ["-s", t.url, "-d", "3", "-c", "10", "--json", "-a", STEALTH.pick_ua()]
+    args = ["-s", t.url, "-d", "3", "-c", "10", "--json", "-u", STEALTH.pick_ua()]
     cmd = build_cmd(plan, args)
     rc, out, err = _run(cmd, timeout)
     if rc != 0 or not out:
@@ -2107,10 +2107,9 @@ def run_sqlmap(url: str, plan: ToolPlan, timeout: int, post_data: str = "", cook
     hdrs = STEALTH.default_headers()
     cookie_val = cookie or auth_cookie_value()
 
-    # Add cookie header if provided
+    # Add cookie flag if provided
     if cookie_val:
         extra += ["--cookie", cookie_val]
-        hdrs.append(f"Cookie: {cookie_val}")
 
     if hdrs:
         extra += ["--headers", "\n".join(hdrs)]
@@ -2666,7 +2665,7 @@ def main():
     ap.add_argument("--wafw00f-timeout",  type=int, default=120)
     ap.add_argument("--testssl-timeout",  type=int, default=600)
     ap.add_argument("--nikto-timeout",    type=int, default=600)
-    ap.add_argument("--nuclei-timeout",   type=int, default=600)
+    ap.add_argument("--nuclei-timeout",   type=int, default=86400)
     ap.add_argument("--wapiti-timeout",   type=int, default=1200)
     ap.add_argument("--sqlmap-timeout",   type=int, default=900)
     ap.add_argument("--ffuf-timeout",     type=int, default=600)
@@ -2730,7 +2729,7 @@ def main():
              "nuclei, wapiti, sqlmap, ffuf, feroxbuster.")
 
     ap.add_argument("--addtimeout", action="store_true",
-        help="Enable process-level timeout for nuclei (uses --nuclei-timeout, default 600s). "
+        help="Enable process-level timeout for nuclei (uses --nuclei-timeout, default 86400s). "
              "By default, nuclei runs without a process-level timeout.")
 
     # ── JSON export flag ───────────────────────────────────────────────
@@ -3247,12 +3246,21 @@ def main():
             tt = time.time()
             # For POST forms, extract post_data from URL
             post_data = ""
-            if "&" in u and "?" in u:
-                # URL like http://host/admin/doLogin?username=admin&password=
-                # Extract the query part as POST data
-                query_part = u.split("?")[-1]
-                post_data = query_part.replace("=", "=test&") + "test"
-                u = u.split("?")[0]
+            if "?" in u:
+                parts = u.split("?", 1)
+                base_u = parts[0]
+                query = parts[1]
+                # If there's multiple params or it looks like a form (username=admin&password=),
+                # convert the query part to POST data.
+                if "&" in query or query.endswith("="):
+                    # Use parse_qsl and urlencode to safely handle parameters
+                    qsl = urllib.parse.parse_qsl(query, keep_blank_values=True)
+                    # For testing purposes, we ensure blank values have something to test
+                    post_items = []
+                    for k, v in qsl:
+                        post_items.append((k, v or "test"))
+                    post_data = urllib.parse.urlencode(post_items)
+                    u = base_u
             fs = run_sqlmap(u, plans["sqlmap"], timeouts["sqlmap"], post_data=post_data)
             log("ok" if fs else "skip",
                 f"  sqlmap {round(time.time()-tt,1)}s — {len(fs)} findings")
