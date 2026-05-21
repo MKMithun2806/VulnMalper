@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VulnMalper v7.1.6  —  Vulnerability pipeline for NetMalper graphs.
+VulnMalper v7.1.7  —  Vulnerability pipeline for NetMalper graphs.
 
 Pipeline:
     NetMalper JSON
@@ -49,7 +49,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-VERSION = "7.1.6"
+VERSION = "7.1.7"
 
 # Background warmup state for docker images and nuclei templates.
 DOCKER_IMAGE_EVENTS: dict[str, threading.Event] = {}
@@ -60,9 +60,6 @@ NUCLEI_TEMPLATE_LOCK = threading.RLock()
 PHASE0_NMAP_EVENT: Optional[threading.Event] = None
 PHASE0_NMAP_RESULT: Optional[bool] = None
 PHASE0_NMAP_LOCK = threading.RLock()
-CRAWLER_IMAGE_EVENT: Optional[threading.Event] = None
-CRAWLER_IMAGE_RESULT: Optional[bool] = None
-CRAWLER_IMAGE_LOCK = threading.RLock()
 
 # ── Stealth / polite-mode profile ───────────────────────────────────────────
 # Realistic, current desktop browser User-Agents. One is picked per run (or
@@ -393,15 +390,8 @@ NIKTO_PORTS  = {80,443,8080,8443}
 TLS_PORTS    = {443,8443}
 PHASE0_NMAP_IMAGE = "instrumentisto/nmap:latest"
 
-def _best_hostname_for_ip(ip: str, nodes: dict) -> Optional[str]:
-    for n in nodes.values():
-        if n["type"] in ("sub","root","cname"):
-            fqdn = n["data"].get("fqdn") or n.get("label")
-            if not fqdn: continue
-            try:
-                if socket.gethostbyname(fqdn) == ip: return fqdn
-            except Exception: continue
-    return None
+def _best_hostname_for_ip(ip: str, cache: dict[str, str]) -> Optional[str]:
+    return cache.get(ip)
 
 def _normalize_url(url: str) -> str:
     """Normalize URL by ensuring consistent format without forcing slash stripping."""
@@ -414,6 +404,21 @@ def parse_netmalper(graph: dict):
     meta  = graph.get("meta", {})
     targets: dict[str, WebTarget] = {}
     services: dict[tuple[str, int, str], ServiceTarget] = {}
+
+    # Pre-compute IP-to-hostname mapping to avoid O(N^2) DNS lookups
+    ip_to_host: dict[str, str] = {}
+    for n in nodes.values():
+        if n["type"] in ("sub", "root", "cname"):
+            fqdn = n["data"].get("fqdn") or n.get("label")
+            if not fqdn:
+                continue
+            try:
+                # Short timeout for DNS resolution
+                ip = socket.gethostbyname(fqdn)
+                if ip:
+                    ip_to_host[ip] = fqdn
+            except Exception:
+                continue
 
     for n in nodes.values():
         if n["type"] != "endpoint": continue
@@ -431,13 +436,20 @@ def parse_netmalper(graph: dict):
     for n in nodes.values():
         if n["type"] != "port": continue
         d = n["data"]
-        port = d.get("port"); svc = (d.get("service") or "").lower()
+        port_raw = d.get("port")
+        if port_raw is None: continue
+        try:
+            port = int(port_raw)
+        except (ValueError, TypeError):
+            continue
+        svc = (d.get("service") or "").lower()
         host = d.get("host") or ""
-        if not host or not port: continue
+        if not host: continue
+        
         looks_web = svc in WEB_SERVICES or port in WEB_PORTS or "http" in svc
         if not looks_web: continue
         scheme = "https" if (svc == "https" or port in (443,8443,9443)) else "http"
-        host_label = _best_hostname_for_ip(host, nodes) or host
+        host_label = _best_hostname_for_ip(host, ip_to_host) or host
         url = f"{scheme}://{host_label}" + (f":{port}" if port not in (80,443) else "") + "/"
         # Normalize URL while preserving trailing slashes if present
         normalized_url = _normalize_url(url)
@@ -452,19 +464,24 @@ def parse_netmalper(graph: dict):
         if n["type"] != "port":
             continue
         d = n["data"]
-        port = d.get("port")
+        port_raw = d.get("port")
+        if port_raw is None: continue
+        try:
+            port = int(port_raw)
+        except (ValueError, TypeError):
+            continue
         svc = (d.get("service") or "").lower()
         host = d.get("host") or ""
-        if not host or not port:
+        if not host:
             continue
         looks_web = svc in WEB_SERVICES or port in WEB_PORTS or "http" in svc
         if looks_web:
             continue
-        host_label = _best_hostname_for_ip(host, nodes) or host
-        key = (host_label, int(port), svc)
+        host_label = _best_hostname_for_ip(host, ip_to_host) or host
+        key = (host_label, port, svc)
         services.setdefault(key, ServiceTarget(
             host=host_label,
-            port=int(port),
+            port=port,
             service=svc or "unknown",
             product=d.get("product", ""),
             src_node=n["id"],
@@ -672,17 +689,6 @@ def wait_for_phase0_nmap_image() -> bool:
         return False
     event.wait()
     return bool(PHASE0_NMAP_RESULT)
-
-def warm_crawler_image():
-    """Background-pull the gospider crawler image when crawling is enabled."""
-    # Note: gospider is now in ALL_TOOLS and handled by warm_docker_images(plans).
-    # This legacy helper is kept as a no-op to avoid breaking other callsites
-    # if any remain, but the heavy lifting is moved to the central warm_docker_images.
-    pass
-
-def wait_for_crawler_image() -> bool:
-    # Legacy wrapper, no longer strictly needed but kept for compatibility.
-    return True
 
 def _run(cmd, timeout, stdin_data: Optional[str] = None):
     try:
@@ -1374,7 +1380,7 @@ def run_wapiti(t: WebTarget, plan: ToolPlan, timeout: int):
                     method = it.get("method") or ""
                     path   = it.get("path") or ""
                     param  = it.get("parameter") or it.get("parameter_name") or ""
-                    full_url = t.url.rstrip("/") + path if path.startswith("/") else (path or t.url)
+                    full_url = urllib.parse.urljoin(t.url, path)
                     findings.append(Finding(
                         target=full_url, tool="wapiti", severity=sev,
                         title=f"{category}" + (f" on `{param}`" if param else ""),
@@ -2216,13 +2222,18 @@ def run_sqlmap(url: str, plan: ToolPlan, timeout: int, post_data: str = "", cook
     if vuln_match and int(vuln_match.group(1)) > 0:
         log("ok", f"sqlmap: found {vuln_match.group(1)} vulnerability(ies) on {url}")
 
-    if not findings:
-        if "is not injectable" in text.lower():
-            log("skip", f"sqlmap: no injectable params on {url}")
-        elif "all parameters appear to be not injectable" in text.lower():
-            log("skip", f"sqlmap: no injection point found in {url}")
-        else:
-            log("info", f"sqlmap: completed but no vulnerabilities found on {url}")
+    # Enhanced SQLi detection: check if sqlmap created a log file for this target,
+    # which is a reliable indicator that it found something.
+    target_host = urllib.parse.urlparse(url).hostname or "target"
+    log_file = os.path.join(host_dir, target_host, "log")
+    if os.path.exists(log_file) and os.path.getsize(log_file) > 0:
+        if not findings:
+            findings.append(Finding(
+                target=url, tool="sqlmap", severity="critical",
+                title="SQL Injection Detected (verified via log)",
+                detail="sqlmap confirmed the target is injectable. See full tool logs for payloads.",
+                reference="https://owasp.org/www-community/attacks/SQL_Injection",
+            ))
 
     shutil.rmtree(host_dir, ignore_errors=True)
     return findings
@@ -2670,6 +2681,7 @@ def main():
     ap.add_argument("--sqlmap-timeout",   type=int, default=900)
     ap.add_argument("--ffuf-timeout",     type=int, default=600)
     ap.add_argument("--feroxbuster-timeout", type=int, default=900)
+    ap.add_argument("--gospider-timeout", type=int, default=600)
     ap.add_argument("--sqlmap-level", type=int, default=None,
                     help="Override sqlmap --level (default: 3 normal, 1 stealth)")
     ap.add_argument("--sqlmap-risk", type=int, default=None,
@@ -2836,8 +2848,6 @@ def main():
     log("info", "Warming docker images in background where needed")
     warm_docker_images(plans)
     warm_nuclei_templates(plans["nuclei"])
-    if targets:
-        warm_crawler_image()
     if service_targets and not have("nmap") and have("docker"):
         warm_phase0_nmap_image()
     runner_map = {k: (v.runner if v else "off") for k, v in plans.items()}
@@ -2848,6 +2858,7 @@ def main():
         "nikto": args.nikto_timeout, "nuclei": args.nuclei_timeout if args.addtimeout else None,
         "wapiti": args.wapiti_timeout, "sqlmap": args.sqlmap_timeout,
         "ffuf": args.ffuf_timeout, "feroxbuster": args.feroxbuster_timeout,
+        "gospider": args.gospider_timeout,
     }
 
     # Disable aggressive fuzzers if ANY stealth/polite flags are set
@@ -3244,18 +3255,15 @@ def main():
         def _sqli_worker(u):
             log("run", f"sqlmap ({plans['sqlmap'].runner}) → {u}")
             tt = time.time()
-            # For POST forms, extract post_data from URL
+            # For POST forms, extract post_data from URL for known login endpoints
             post_data = ""
             if "?" in u:
                 parts = u.split("?", 1)
                 base_u = parts[0]
                 query = parts[1]
-                # If there's multiple params or it looks like a form (username=admin&password=),
-                # convert the query part to POST data.
-                if "&" in query or query.endswith("="):
-                    # Use parse_qsl and urlencode to safely handle parameters
+                # Only force POST for likely login/auth forms to avoid 405 errors on search pages
+                if any(x in base_u.lower() for x in ["login", "auth", "signup", "signin"]):
                     qsl = urllib.parse.parse_qsl(query, keep_blank_values=True)
-                    # For testing purposes, we ensure blank values have something to test
                     post_items = []
                     for k, v in qsl:
                         post_items.append((k, v or "test"))
