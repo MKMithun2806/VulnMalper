@@ -11,7 +11,16 @@ cd "$(dirname "$0")"
 SCRIPT=vulnmalper.py
 [ -f "$SCRIPT" ] || { echo "vulnmalper.py not found"; exit 1; }
 
-VERSION="${1:-$(grep -Po 'VERSION\s*=\s*"\K[0-9.]+' "$SCRIPT")}"
+normalize_version() {
+  local ver="${1#v}"
+  case "$ver" in
+    [0-9]) echo "${ver}.0.0" ;;
+    [0-9].[0-9]) echo "${ver}.0" ;;
+    *) echo "$ver" ;;
+  esac
+}
+
+VERSION="$(normalize_version "${1:-$(grep -Po 'VERSION\s*=\s*"\K[0-9.]+' "$SCRIPT")}")"
 echo ">> Building vulnmalper $VERSION"
 
 command -v dpkg-deb >/dev/null 2>&1 || {

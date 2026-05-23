@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VulnMalper v7.1.7  —  Vulnerability pipeline for NetMalper graphs.
+VulnMalper v7.1.8  —  Vulnerability pipeline for NetMalper graphs.
 
 Pipeline:
     NetMalper JSON
@@ -34,6 +34,7 @@ import ipaddress
 import json
 import os
 import random
+import shlex
 import re
 import shutil
 import socket
@@ -49,7 +50,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-VERSION = "7.1.7"
+VERSION = "7.1.8"
 
 # Background warmup state for docker images and nuclei templates.
 DOCKER_IMAGE_EVENTS: dict[str, threading.Event] = {}
@@ -563,14 +564,36 @@ def plan_tools(runner_pref: str) -> dict[str, Optional[ToolPlan]]:
 def ensure_docker_image(image: str, quiet: bool = False):
     try:
         subprocess.run(["docker","image","inspect",image],
-                       capture_output=True, timeout=10, check=True)
+                       capture_output=True, text=True, timeout=10, check=True)
         return True
-    except subprocess.CalledProcessError:
+    except subprocess.TimeoutExpired as e:
         if not quiet:
-            log("info", f"Pulling docker image: {image}")
+            log("warn", f"docker image inspect timed out for {image} after 10s")
+        return False
+    except subprocess.CalledProcessError as e:
+        if not quiet:
+            details = _coerce_subprocess_text(getattr(e, "stderr", "")) or _coerce_subprocess_text(getattr(e, "stdout", ""))
+            details = details.strip()
+            if details:
+                log("info", f"Pulling docker image: {image} ({details})")
+            else:
+                log("info", f"Pulling docker image: {image}")
         try:
-            subprocess.run(["docker","pull",image], timeout=600, check=True)
+            subprocess.run(["docker","pull",image], capture_output=True, text=True, timeout=600, check=True)
             return True
+        except subprocess.TimeoutExpired:
+            if not quiet:
+                log("err", f"docker pull {image} timed out after 600s")
+            return False
+        except subprocess.CalledProcessError as pull_err:
+            if not quiet:
+                details = _coerce_subprocess_text(getattr(pull_err, "stderr", "")) or _coerce_subprocess_text(getattr(pull_err, "stdout", ""))
+                details = details.strip()
+                if details:
+                    log("err", f"docker pull {image} failed (rc={pull_err.returncode}): {details}")
+                else:
+                    log("err", f"docker pull {image} failed (rc={pull_err.returncode})")
+            return False
         except Exception as e:
             if not quiet:
                 log("err", f"docker pull {image} failed: {e}")
@@ -690,17 +713,40 @@ def wait_for_phase0_nmap_image() -> bool:
     event.wait()
     return bool(PHASE0_NMAP_RESULT)
 
+def _coerce_subprocess_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+def _format_cmd(cmd: list[str]) -> str:
+    try:
+        return shlex.join(str(part) for part in cmd)
+    except Exception:
+        return " ".join(str(part) for part in cmd)
+
 def _run(cmd, timeout, stdin_data: Optional[str] = None):
+    cmd_text = _format_cmd(cmd)
     try:
         p = subprocess.run(cmd, input=stdin_data, capture_output=True,
                            text=True, timeout=timeout)
         return p.returncode, p.stdout, p.stderr
-    except subprocess.TimeoutExpired:
-        return 124, "", f"timeout after {timeout}s"
+    except subprocess.TimeoutExpired as e:
+        stdout = _coerce_subprocess_text(getattr(e, "stdout", ""))
+        stderr = _coerce_subprocess_text(getattr(e, "stderr", ""))
+        parts = [f"timeout after {timeout}s"]
+        if cmd_text:
+            parts.append(f"while running: {cmd_text}")
+        if stderr.strip():
+            parts.append("stderr: " + stderr.strip())
+        if stdout.strip():
+            parts.append("stdout: " + stdout.strip())
+        return 124, stdout, "\n".join(parts)
     except FileNotFoundError as e:
-        return 127, "", str(e)
+        return 127, "", f"{cmd_text}: {e}" if cmd_text else str(e)
     except Exception as e:
-        return 1, "", str(e)
+        return 1, "", f"{cmd_text}: {e}" if cmd_text else str(e)
 
 def build_cmd(plan: ToolPlan, tool_args: list[str],
               mount: Optional[tuple[str,str]] = None,
@@ -3104,7 +3150,7 @@ def main():
                         all_findings.extend(fs)
 
     # ── PHASE 2: scan ──────────────────────────────────────────────────────
-    _phase("Phase 2 — Scanning (testssl, nikto, nuclei, wapiti)")
+    _phase("Phase 2 — Scanning (nuclei, wapiti, testssl, nikto)")
 
     # Snapshot the user-configured stealth profile so per-target auto-mode
     # swaps can always restore it cleanly between targets.
@@ -3127,25 +3173,11 @@ def main():
             STEALTH = new_prof
             swapped = True
         try:
-            # testssl only for HTTPS (TLS) ports - check both port AND scheme
-            if plans["testssl"] and t.scheme == "https" and t.port in TLS_PORTS:
-                log("run", f"testssl ({plans['testssl'].runner}) → {t.url}")
-                tt = time.time()
-                fs = run_testssl(t, plans["testssl"], timeouts["testssl"])
-                log("ok" if fs else "skip",
-                    f"  testssl {round(time.time()-tt,1)}s — {len(fs)} findings")
-                out.extend(fs)
-                STEALTH.sleep_jitter()  # avoid burst pattern between tools
-            # nikto only on HTTP/HTTPS ports with proper scheme check
-            if plans["nikto"] and t.scheme in ("http", "https") and t.port in NIKTO_PORTS:
-                log("run", f"nikto ({plans['nikto'].runner}) → {t.url}")
-                tt = time.time()
-                fs = run_nikto(t, plans["nikto"], timeouts["nikto"])
-                log("ok" if fs else "skip",
-                    f"  nikto {round(time.time()-tt,1)}s — {len(fs)} findings")
-                out.extend(fs)
-                STEALTH.sleep_jitter()
-            # nuclei on all HTTP targets
+            # ── High-value scanners first ──────────────────────────────
+            # nuclei + wapiti always run before nikto/testssl so their
+            # results are never starved by nikto's 600s timeout.
+
+            # nuclei on all HTTP targets (run first — most valuable)
             if plans["nuclei"]:
                 log("run", f"nuclei ({plans['nuclei'].runner}) → {t.url}")
                 tt = time.time()
@@ -3153,7 +3185,7 @@ def main():
                 log("ok" if fs else "skip",
                     f"  nuclei {round(time.time()-tt,1)}s — {len(fs)} findings")
                 out.extend(fs)
-                STEALTH.sleep_jitter()
+                STEALTH.sleep_jitter()  # avoid burst pattern between tools
             # wapiti — active app scanner, all HTTP targets
             if plans["wapiti"]:
                 log("run", f"wapiti ({plans['wapiti'].runner}) → {t.url}")
@@ -3162,6 +3194,33 @@ def main():
                 log("ok" if fs else "skip",
                     f"  wapiti {round(time.time()-tt,1)}s — {len(fs)} findings")
                 out.extend(fs)
+                STEALTH.sleep_jitter()
+
+            # ── Slower / lower-priority scanners ──────────────────────
+
+            # testssl only for HTTPS (TLS) ports - check both port AND scheme
+            if plans["testssl"] and t.scheme == "https" and t.port in TLS_PORTS:
+                log("run", f"testssl ({plans['testssl'].runner}) → {t.url}")
+                tt = time.time()
+                fs = run_testssl(t, plans["testssl"], timeouts["testssl"])
+                log("ok" if fs else "skip",
+                    f"  testssl {round(time.time()-tt,1)}s — {len(fs)} findings")
+                out.extend(fs)
+                STEALTH.sleep_jitter()
+            # nikto — only on original NetMalper targets (root/port),
+            # NEVER on endpoints discovered by crawlers/fuzzers.
+            # nikto's 600s timeout per discovered URL would starve
+            # nuclei and wapiti out of execution time.
+            if plans["nikto"] and t.scheme in ("http", "https") and t.port in NIKTO_PORTS:
+                if not t.discovered:
+                    log("run", f"nikto ({plans['nikto'].runner}) → {t.url}")
+                    tt = time.time()
+                    fs = run_nikto(t, plans["nikto"], timeouts["nikto"])
+                    log("ok" if fs else "skip",
+                        f"  nikto {round(time.time()-tt,1)}s — {len(fs)} findings")
+                    out.extend(fs)
+                else:
+                    log("skip", f"nikto → {t.url} (discovered endpoint, skipping)")
             return out
         finally:
             if swapped:
