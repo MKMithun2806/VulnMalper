@@ -59,6 +59,7 @@ sudo apt install nikto sqlmap whatweb wafw00f
 pip install wapiti3
 go install github.com/projectdiscovery/httpx/cmd/httpx@latest
 go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+go install github.com/projectdiscovery/katana/cmd/katana@latest
 git clone --depth 1 https://github.com/drwetter/testssl.sh.git \
   && sudo ln -s "$PWD/testssl.sh/testssl.sh" /usr/local/bin/testssl.sh
 ```
@@ -66,7 +67,7 @@ git clone --depth 1 https://github.com/drwetter/testssl.sh.git \
 Docker images used when local binaries are missing:
 `projectdiscovery/httpx`, `secsi/whatweb`, `secsi/wafw00f`,
 `drwetter/testssl.sh`, `sullo/nikto`, `projectdiscovery/nuclei`,
-`cyberwatch/wapiti`, `googlesky/sqlmap`.
+`cyberwatch/wapiti`, `googlesky/sqlmap`, `projectdiscovery/katana`.
 
 ## Usage
 
@@ -90,12 +91,12 @@ vulnmalper example.json                      # scan  (VulnMalper)
 | `--threads 5` | Parallel target workers. |
 | `--max-targets 10` | Cap how many targets get scanned. |
 | `--out NAME` | Writes `NAME.md`. Default: `vulnmalper_<target>_<ts>.md`. |
-| `--httpx-timeout`, `--whatweb-timeout`, `--wafw00f-timeout`, `--testssl-timeout`, `--nikto-timeout`, `--nuclei-timeout`, `--wapiti-timeout`, `--sqlmap-timeout` | Per-tool timeouts (seconds). |
+| `--httpx-timeout`, `--whatweb-timeout`, `--wafw00f-timeout`, `--testssl-timeout`, `--nikto-timeout`, `--nuclei-timeout`, `--wapiti-timeout`, `--sqlmap-timeout`, `--katana-timeout` | Per-tool timeouts (seconds). |
 
 ## How smart dispatch works
 
 1. **Phase 1 — Fingerprint.** `httpx` probes liveness + tech on every URL. `whatweb` + `wafw00f` run in parallel on alive targets. Dead targets are dropped. WAF annotations are attached to each target.
-2. **Phase 1.5 — Crawl.** `gospider` discovers extra endpoints before fuzzing starts, then the new URLs are deduped and added to the phase 2 target pool.
+2. **Phase 1.5 — Crawl.** `katana` discovers extra endpoints before fuzzing starts, then the new URLs are deduped and added to the phase 2 target pool.
 3. **Phase 2 — Scan.** `testssl.sh` runs on TLS ports (443/8443) only. `nikto` runs on classic web ports (80/443/8080/8443) only. `nuclei` + `wapiti` run on every alive HTTP target. Injection-flavored URLs surfaced by these tools get queued for phase 3.
 4. **Phase 3 — Verify.** `sqlmap` runs only against the curated queue — NetMalper's query-param endpoints + anything nuclei/nikto/wapiti surfaced as sqli/injection-tagged. No blind `?=` spraying.
 

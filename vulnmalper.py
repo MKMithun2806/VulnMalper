@@ -491,7 +491,7 @@ def parse_netmalper(graph: dict):
 
 # ── Runner layer (local + docker) ───────────────────────────────────────────
 ALL_TOOLS = ["httpx","whatweb","wafw00f","testssl","nikto",
-             "nuclei","wapiti","sqlmap","ffuf","feroxbuster", "gospider"]
+             "nuclei","wapiti","sqlmap","ffuf","feroxbuster", "katana"]
 
 DOCKER_IMAGES = {
     "httpx":   "projectdiscovery/httpx:latest",
@@ -504,7 +504,7 @@ DOCKER_IMAGES = {
     "sqlmap":  "googlesky/sqlmap:latest",
     "ffuf":    "secsi/ffuf:latest",
     "feroxbuster": "epi052/feroxbuster",
-    "gospider": "bormaa/b-hunters-gospider",
+    "katana": "projectdiscovery/katana:latest",
 }
 # Some tools publish their binary under a different name inside the image:
 DOCKER_ENTRYPOINTS = {
@@ -522,7 +522,7 @@ LOCAL_BINARIES = {
     "sqlmap":  "sqlmap",
     "ffuf":    "ffuf",
     "feroxbuster": "feroxbuster",
-    "gospider": "gospider",
+    "katana": "katana",
 }
 
 def have(cmd: str) -> bool:
@@ -1587,10 +1587,11 @@ def _collect_json_urls(blob) -> list[str]:
     return urls
 
 def run_crawler(t: WebTarget, plan: Optional[ToolPlan], timeout: int) -> list[str]:
-    """Best-effort crawl with gospider. Supports local or docker via ToolPlan."""
+    """Best-effort crawl with katana. Supports local or docker via ToolPlan."""
     if not plan:
         return []
-    args = ["-s", t.url, "-d", "3", "-c", "10", "--json", "-u", STEALTH.pick_ua()]
+    # katana equivalent: -u for url, -d for depth, -c for concurrency, -jc for JS crawl, -json for JSON, -nc for no-color
+    args = ["-u", t.url, "-d", "3", "-c", "10", "-jc", "-json", "-nc", "-H", f"User-Agent: {STEALTH.pick_ua()}"]
     cmd = build_cmd(plan, args)
     rc, out, err = _run(cmd, timeout)
     if rc != 0 or not out:
@@ -2727,7 +2728,7 @@ def main():
     ap.add_argument("--sqlmap-timeout",   type=int, default=900)
     ap.add_argument("--ffuf-timeout",     type=int, default=600)
     ap.add_argument("--feroxbuster-timeout", type=int, default=900)
-    ap.add_argument("--gospider-timeout", type=int, default=600)
+    ap.add_argument("--katana-timeout", type=int, default=600)
     ap.add_argument("--sqlmap-level", type=int, default=None,
                     help="Override sqlmap --level (default: 3 normal, 1 stealth)")
     ap.add_argument("--sqlmap-risk", type=int, default=None,
@@ -2784,7 +2785,7 @@ def main():
              "`--no-timeout=7200` (all tools, 2h) or "
              "`--no-timeout nuclei,nikto=10800` (those two, 3h). "
              "Valid tool names: httpx, whatweb, wafw00f, testssl, nikto, "
-             "nuclei, wapiti, sqlmap, ffuf, feroxbuster.")
+             "nuclei, wapiti, sqlmap, ffuf, feroxbuster, katana.")
 
     ap.add_argument("--addtimeout", action="store_true",
         help="Enable process-level timeout for nuclei (uses --nuclei-timeout, default 86400s). "
@@ -2904,7 +2905,7 @@ def main():
         "nikto": args.nikto_timeout, "nuclei": args.nuclei_timeout if args.addtimeout else None,
         "wapiti": args.wapiti_timeout, "sqlmap": args.sqlmap_timeout,
         "ffuf": args.ffuf_timeout, "feroxbuster": args.feroxbuster_timeout,
-        "gospider": args.gospider_timeout,
+        "katana": args.katana_timeout,
     }
 
     # Disable aggressive fuzzers if ANY stealth/polite flags are set
@@ -3014,7 +3015,7 @@ def main():
         crawl_candidates = []
 
     if crawl_candidates:
-        _phase("Phase 1.5 — Crawl discovery (gospider)")
+        _phase("Phase 1.5 — Crawl discovery (katana)")
         discovered_targets: list[WebTarget] = []
         existing_urls = {_normalize_discovered_url(t.url) for t in targets}
 
@@ -3043,10 +3044,10 @@ def main():
                 if strategy == "stealth":
                     log("skip", f"crawl → {t.url} skipped in auto stealth mode ({reason})")
                     return []
-            urls = run_crawler(t, plans.get("gospider"), min(timeouts.get("gospider", 600), 600))
+            urls = run_crawler(t, plans.get("katana"), min(timeouts.get("katana", 600), 600))
             if not urls:
                 return []
-            log("run", f"gospider crawl → {t.url} ({len(urls)} raw url(s))")
+            log("run", f"katana crawl → {t.url} ({len(urls)} raw url(s))")
             return _register_discovered_urls(t, urls)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as ex:
