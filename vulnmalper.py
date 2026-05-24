@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VulnMalper v7.1.8  —  Vulnerability pipeline for NetMalper graphs.
+VulnMalper v7.2.0  —  Vulnerability pipeline for NetMalper graphs.
 
 Pipeline:
     NetMalper JSON
@@ -45,12 +45,13 @@ import time
 import threading
 import urllib.parse
 import xml.etree.ElementTree as ET
+import html.parser
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-VERSION = "7.1.8"
+VERSION = "7.2.2"
 
 # Background warmup state for docker images and nuclei templates.
 DOCKER_IMAGE_EVENTS: dict[str, threading.Event] = {}
@@ -579,12 +580,20 @@ def ensure_docker_image(image: str, quiet: bool = False):
             else:
                 log("info", f"Pulling docker image: {image}")
         try:
-            subprocess.run(["docker","pull",image], capture_output=True, text=True, timeout=600, check=True)
+            # First attempt: 120s timeout
+            subprocess.run(["docker","pull",image], capture_output=True, text=True, timeout=120, check=True)
             return True
         except subprocess.TimeoutExpired:
             if not quiet:
-                log("err", f"docker pull {image} timed out after 600s")
-            return False
+                log("warn", f"docker pull {image} timed out after 120s, retrying with 300s...")
+            try:
+                # Retry: 300s timeout
+                subprocess.run(["docker","pull",image], capture_output=True, text=True, timeout=300, check=True)
+                return True
+            except Exception as retry_err:
+                if not quiet:
+                    log("err", f"docker pull {image} retry failed: {retry_err}")
+                return False
         except subprocess.CalledProcessError as pull_err:
             if not quiet:
                 details = _coerce_subprocess_text(getattr(pull_err, "stderr", "")) or _coerce_subprocess_text(getattr(pull_err, "stdout", ""))
@@ -1240,7 +1249,7 @@ def run_nikto(t: WebTarget, plan: ToolPlan, timeout: int):
         # Also extract any parameter-like patterns (e.g., ?id=, ?query=) from nikto msgs
         param_patterns = re.findall(r'\?(\w+)=', msg)
         for param in param_patterns:
-            url_with_param = t.url.rstrip("/") + "?" + param + "="
+            url_with_param = t.url.rstrip("/") + "?" + param + "=1"
             if url_with_param not in t.injectable:
                 t.injectable.append(url_with_param)
     shutil.rmtree(host_dir, ignore_errors=True)
@@ -1254,8 +1263,10 @@ def run_nuclei(t: WebTarget, plan: ToolPlan, severity: str, timeout: int):
             "-severity", ",".join(keep),
             "-exclude-tags", "fuzzing,dos,helpers",
             "-stats",
-            "-timeout","10","-rl",str(rl),
+            "-timeout","15","-retries","2","-rl",str(rl),
             "-H", f"User-Agent: {STEALTH.pick_ua()}"]
+    if t.scheme != "https":
+        args += ["-ept", "ssl,tls,dns"]
     auth_hdr = auth_basic_header()
     if auth_hdr:
         args += ["-H", auth_hdr]
@@ -1295,7 +1306,7 @@ def run_nuclei(t: WebTarget, plan: ToolPlan, severity: str, timeout: int):
         # nuclei -rate-limit-duration accepts Go duration: "2s","5s",...
         args += ["-rate-limit-duration", "5s" if STEALTH.slow else "2s"]
         # Skip a host if it 30x-errors before that, or we waste budget.
-        args += ["-mhe", "10"]
+        args += ["-mhe", "30"]
 
     # ── Quiet template set: exclude noisy/intrusive tags + redundant globs.
     # The curated tag list above is the primary filter; these are extra
@@ -1318,7 +1329,7 @@ def run_nuclei(t: WebTarget, plan: ToolPlan, severity: str, timeout: int):
     log("info", f"[*] nuclei profile:")
     log("info", f"    tags=none (all templates)")
     log("info", f"    severity={','.join(keep)}")
-    log("info", f"    timeout=10")
+    log("info", f"    timeout=15")
     log("info", f"    rl={rl}")
 
     cmd = build_cmd(plan, args, mount=nuclei_mount)
@@ -1396,6 +1407,12 @@ def run_wapiti(t: WebTarget, plan: ToolPlan, timeout: int):
         for inj_url in t.injectable[:20]:
             extra += ["--start", inj_url]
     extra += ["--module", "csrf,xss,sql,xxe,redirect,ssrf,timesql,blindsql,wapp,nikto,htaccess,cookieflags,csp,headers,http_headers"]
+    
+    # Seed wapiti with URLs ffuf/feroxbuster/nikto/nuclei already discovered
+    for seed in t.injectable[:10]:
+        extra += ["--start", seed]
+    extra += ["--max-links-per-page", "100", "--scope", "folder" if not t.discovered else "page"]
+
     if AUTH.user and AUTH.password:
         extra += ["--auth-credential", f"{AUTH.user}%{AUTH.password}", "--auth-method", "post"]
     if AUTH.cookie:
@@ -1403,12 +1420,12 @@ def run_wapiti(t: WebTarget, plan: ToolPlan, timeout: int):
     if plan.runner == "docker":
         container_dir = "/wrk"
         args = ["-u", t.url, "-f","json","-o", f"{container_dir}/{report}",
-                "--flush-session","--level","1",
+                "--flush-session","--level","2",
                 "--max-scan-time", str(min(timeout, 1200)), "-S","paranoid"] + extra
         cmd = build_cmd(plan, args, mount=(host_dir, container_dir))
     else:
         args = ["-u", t.url, "-f","json","-o", os.path.join(host_dir, report),
-                "--flush-session","--level","1",
+                "--flush-session","--level","2",
                 "--max-scan-time", str(min(timeout, 1200)), "-S","paranoid"] + extra
         cmd = build_cmd(plan, args)
     rc, out, err = _run(cmd, timeout + 30)
@@ -1436,9 +1453,9 @@ def run_wapiti(t: WebTarget, plan: ToolPlan, timeout: int):
                     # Add URLs with parameters to injectable for sqlmap testing
                     # Include SQLi, XSS, and any other parameter-based vulnerabilities
                     if param and "?" not in full_url:
-                        injectable_url = full_url + "?" + param + "="
+                        injectable_url = full_url + "?" + param + "=1"
                     elif param:
-                        injectable_url = full_url + "&" + param + "="
+                        injectable_url = full_url + "&" + param + "=1"
                     else:
                         injectable_url = full_url
                     if injectable_url not in t.injectable:
@@ -1592,6 +1609,8 @@ def run_crawler(t: WebTarget, plan: Optional[ToolPlan], timeout: int) -> list[st
         return []
     # katana equivalent: -u for url, -d for depth, -c for concurrency, -jc for JS crawl, -json for JSON, -nc for no-color
     args = ["-u", t.url, "-d", "3", "-c", "10", "-jc", "-json", "-nc", "-H", f"User-Agent: {STEALTH.pick_ua()}"]
+    if STEALTH.headless:
+        args.append("-hl")
     cmd = build_cmd(plan, args)
     rc, out, err = _run(cmd, timeout)
     if rc != 0 or not out:
@@ -2060,8 +2079,8 @@ def build_auto_profile(strategy: str, base: StealthProfile) -> StealthProfile:
     return StealthProfile(
         polite=False, slow=False,
         user_agent=None, headers=list(base.headers),
-        rate_limit=60,            # moderate
-        delay_ms=150,
+        rate_limit=40,            # moderate
+        delay_ms=200,
         headless=base.headless,
         jitter=True,
         quiet=False,
@@ -2145,7 +2164,83 @@ def run_service_chain(t: WebTarget, timeout: int = 15) -> list[Finding]:
     return findings
 
 # ────────────────────────────────────────────────────────────────────────────
-#  PHASE 3 — VERIFY (sqlmap, only on endpoints upstream flagged)
+def discover_forms(url: str) -> list[dict]:
+    """Fetch a page and extract all forms with their fields and action URLs."""
+    import urllib.request, urllib.error, ssl, html.parser
+
+    class FormParser(html.parser.HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.forms = []
+            self.current_form = None
+
+        def handle_starttag(self, tag, attrs):
+            attrs = dict(attrs)
+            if tag == "form":
+                self.current_form = {
+                    "action": attrs.get("action", ""),
+                    "method": attrs.get("method", "get").lower(),
+                    "fields": {}
+                }
+            elif tag == "input" and self.current_form is not None:
+                name = attrs.get("name")
+                val = attrs.get("value", "test")
+                typ = attrs.get("type", "text").lower()
+                if name and typ not in ("submit", "button", "image", "reset"):
+                    self.current_form["fields"][name] = val or "test"
+            elif tag == "textarea" and self.current_form is not None:
+                name = attrs.get("name")
+                if name:
+                    self.current_form["fields"][name] = "test"
+
+        def handle_endtag(self, tag):
+            if tag == "form" and self.current_form:
+                self.forms.append(self.current_form)
+                self.current_form = None
+
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    req = urllib.request.Request(url, headers={"User-Agent": STEALTH.pick_ua()})
+    try:
+        with urllib.request.urlopen(req, timeout=10, context=ctx) as r:
+            body = r.read(50000).decode("utf-8", errors="replace")
+    except Exception:
+        return []
+
+    parser = FormParser()
+    parser.feed(body)
+    return parser.forms
+
+def build_sqlmap_targets(t: WebTarget) -> list[tuple[str, str, str]]:
+    """Returns list of (url, post_data, method) tuples."""
+    targets = []
+
+    # Discover real forms on this page
+    forms = discover_forms(t.url)
+    for form in forms:
+        action = form["action"]
+        if action.startswith("http"):
+            action_url = action
+        elif action.startswith("/"):
+            action_url = f"{t.scheme}://{t.host}{action}"
+        elif action == "" or action == "#":
+            action_url = t.url
+        else:
+            action_url = t.url.rstrip("/") + "/" + action
+
+        post_data = urllib.parse.urlencode(form["fields"]) if form["fields"] else ""
+        method = form["method"]
+        targets.append((action_url, post_data if method == "post" else "", method))
+
+    # Also add any upstream-flagged injectable URLs (from nuclei/nikto)
+    for u in t.injectable:
+        if "?" in u and not any(u == x[0] for x in targets):
+            targets.append((u, "", "get"))
+
+    return targets
+
+# ── PHASE 3 — VERIFY (sqlmap, only on endpoints upstream flagged)
 # ────────────────────────────────────────────────────────────────────────────
 def run_sqlmap(url: str, plan: ToolPlan, timeout: int, post_data: str = "", cookie: str = ""):
     host_dir = f"/tmp/vulnmalper_sqlmap_{abs(hash(url))}"
@@ -2209,7 +2304,7 @@ def run_sqlmap(url: str, plan: ToolPlan, timeout: int, post_data: str = "", cook
     
     # For demo/vulnerable targets, be more aggressive
     # Skip smart mode, go straight to full scan
-    extra += ["--smart"]  # Keep smart but combine with other options
+    # extra += ["--smart"]  # Keep smart but combine with other options
     
     # No prompt for user interaction
     extra += ["--batch", "--non-interactive"]
@@ -3021,11 +3116,13 @@ def main():
 
         def _register_discovered_urls(source: WebTarget, urls: list[str]) -> list[WebTarget]:
             new_targets: list[WebTarget] = []
+            existing_urls_lower = {u.lower() for u in existing_urls}
             for u in urls:
                 normalized_url = _normalize_discovered_url(u)
-                if not normalized_url or normalized_url in existing_urls:
+                if not normalized_url or normalized_url.lower() in existing_urls_lower:
                     continue
                 existing_urls.add(normalized_url)
+                existing_urls_lower.add(normalized_url.lower())
                 p = urllib.parse.urlparse(normalized_url)
                 new_targets.append(WebTarget(
                     url=normalized_url,
@@ -3123,13 +3220,13 @@ def main():
                     discovered_targets.extend(results)
         
         if discovered_targets:
-            seen_urls = {_normalize_discovered_url(t.url) for t in targets}
+            seen_urls_lower = {_normalize_discovered_url(t.url).lower() for t in targets}
             unique_new: dict[str, WebTarget] = {}
             for nt in discovered_targets:
                 normalized_url = _normalize_discovered_url(nt.url)
-                if not normalized_url or normalized_url in seen_urls:
+                if not normalized_url or normalized_url.lower() in seen_urls_lower:
                     continue
-                seen_urls.add(normalized_url)
+                seen_urls_lower.add(normalized_url.lower())
                 unique_new[normalized_url] = nt
 
             new_list = list(unique_new.values())
@@ -3187,15 +3284,6 @@ def main():
                     f"  nuclei {round(time.time()-tt,1)}s — {len(fs)} findings")
                 out.extend(fs)
                 STEALTH.sleep_jitter()  # avoid burst pattern between tools
-            # wapiti — active app scanner, all HTTP targets
-            if plans["wapiti"]:
-                log("run", f"wapiti ({plans['wapiti'].runner}) → {t.url}")
-                tt = time.time()
-                fs = run_wapiti(t, plans["wapiti"], timeouts["wapiti"])
-                log("ok" if fs else "skip",
-                    f"  wapiti {round(time.time()-tt,1)}s — {len(fs)} findings")
-                out.extend(fs)
-                STEALTH.sleep_jitter()
 
             # ── Slower / lower-priority scanners ──────────────────────
 
@@ -3222,6 +3310,17 @@ def main():
                     out.extend(fs)
                 else:
                     log("skip", f"nikto → {t.url} (discovered endpoint, skipping)")
+
+            # wapiti — active app scanner, all HTTP targets
+            # Run after nikto so it can use nikto's discovered endpoints as seeds.
+            if plans["wapiti"]:
+                log("run", f"wapiti ({plans['wapiti'].runner}) → {t.url}")
+                tt = time.time()
+                fs = run_wapiti(t, plans["wapiti"], timeouts["wapiti"])
+                log("ok" if fs else "skip",
+                    f"  wapiti {round(time.time()-tt,1)}s — {len(fs)} findings")
+                out.extend(fs)
+                STEALTH.sleep_jitter()
             return out
         finally:
             if swapped:
@@ -3259,39 +3358,7 @@ def main():
     # ── PHASE 3: sqlmap verification on curated endpoints ──────────────────
     _phase("Phase 3 — Verifying SQLi candidates (sqlmap)")
 
-    # Also scan all endpoints with query params even if Nuclei didn't flag them.
-    # This is a fallback to catch SQLi that Nuclei templates might miss,
-    # especially on standard patterns like login forms.
-    for t in targets:
-        if "?" in t.url and t.url not in t.injectable:
-            t.injectable.append(t.url)
-
-    # Try common parameters on likely vulnerable pages (JSP/PHP/ASP)
-    COMMON_PARAMS = ["id", "query", "search", "user", "pass", "login", "name", "email", "q"]
-    for t in targets:
-        if any(t.url.endswith(ext) for ext in [".jsp", ".php", ".asp", ".aspx", ".do"]):
-            for param in COMMON_PARAMS:
-                url_with_param = t.url.rstrip("/") + "?" + param + "="
-                if url_with_param not in t.injectable:
-                    t.injectable.append(url_with_param)
-    
-    # Also try login forms with POST data - these are common SQLi targets
-    # Try common login endpoints with POST data
-    LOGIN_PARAMS = [
-        ("/admin/doLogin", "username=admin&password="),
-        ("/doLogin", "username=admin&password="),
-        ("/login", "username=admin&password="),
-        ("/auth", "username=admin&password="),
-    ]
-    for t in targets:
-        for path, post_template in LOGIN_PARAMS:
-            if path in t.url or t.url.endswith("/admin") or "login" in t.url:
-                full_url = t.url.rstrip("/") + path if path.startswith("/") else t.url + path
-                post_url = full_url + "?" + post_template.split("&")[0] + "="
-                if post_url not in t.injectable:
-                    t.injectable.append(post_url)
-
-    sqli_queue: list[str] = []
+    sqli_queue: list[tuple[str, str]] = []  # (url, post_data)
     for t in targets:
         if auto_mode:
             strategy, reason = _ensure_auto_strategy(t)
@@ -3299,11 +3366,9 @@ def main():
                 if t.injectable:
                     log("skip", f"sqlmap candidates on {t.url} skipped in auto stealth mode ({reason})")
                 continue
-        for u in t.injectable:
-            # Normalize URL to remove trailing slashes for deduplication
-            normalized_u = _normalize_url(u)
-            if normalized_u not in sqli_queue:
-                sqli_queue.append(normalized_u)
+        for url, post_data, method in build_sqlmap_targets(t):
+            if (url, post_data) not in sqli_queue:
+                sqli_queue.append((url, post_data))
 
     if not plans["sqlmap"]:
         log("skip", "sqlmap unavailable — skipping phase 3")
@@ -3311,30 +3376,17 @@ def main():
         log("skip", "No injectable endpoints surfaced by upstream tools")
     else:
         log("info", f"{len(sqli_queue)} endpoint(s) flagged for sqlmap verification:")
-        for u in sqli_queue: print(f"  {C.GY}•{C.R} {u}")
-        def _sqli_worker(u):
-            log("run", f"sqlmap ({plans['sqlmap'].runner}) → {u}")
+        for u, pd in sqli_queue: print(f"  {C.GY}•{C.R} {u}")
+        def _sqli_worker(item):
+            url, post_data = item
+            log("run", f"sqlmap ({plans['sqlmap'].runner}) → {url}")
             tt = time.time()
-            # For POST forms, extract post_data from URL for known login endpoints
-            post_data = ""
-            if "?" in u:
-                parts = u.split("?", 1)
-                base_u = parts[0]
-                query = parts[1]
-                # Only force POST for likely login/auth forms to avoid 405 errors on search pages
-                if any(x in base_u.lower() for x in ["login", "auth", "signup", "signin"]):
-                    qsl = urllib.parse.parse_qsl(query, keep_blank_values=True)
-                    post_items = []
-                    for k, v in qsl:
-                        post_items.append((k, v or "test"))
-                    post_data = urllib.parse.urlencode(post_items)
-                    u = base_u
-            fs = run_sqlmap(u, plans["sqlmap"], timeouts["sqlmap"], post_data=post_data)
+            fs = run_sqlmap(url, plans["sqlmap"], timeouts["sqlmap"], post_data=post_data)
             log("ok" if fs else "skip",
                 f"  sqlmap {round(time.time()-tt,1)}s — {len(fs)} findings")
             return fs
         if args.threads <= 1:
-            for u in sqli_queue: all_findings.extend(_sqli_worker(u))
+            for item in sqli_queue: all_findings.extend(_sqli_worker(item))
         else:
             with concurrent.futures.ThreadPoolExecutor(max_workers=min(args.threads,3)) as ex:
                 for fs in ex.map(_sqli_worker, sqli_queue):
