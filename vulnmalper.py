@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VulnMalper v7.2.0  —  Vulnerability pipeline for NetMalper graphs.
+VulnMalper v7.2.5  —  Vulnerability pipeline for NetMalper graphs.
 
 Pipeline:
     NetMalper JSON
@@ -38,12 +38,15 @@ import shlex
 import re
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
 import time
 import threading
 import urllib.parse
+import urllib.error
+import urllib.request
 import xml.etree.ElementTree as ET
 import html.parser
 from dataclasses import dataclass, field, asdict
@@ -51,7 +54,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-VERSION = "7.2.2"
+VERSION = "7.2.5"
 
 # Background warmup state for docker images and nuclei templates.
 DOCKER_IMAGE_EVENTS: dict[str, threading.Event] = {}
@@ -580,32 +583,25 @@ def ensure_docker_image(image: str, quiet: bool = False):
             else:
                 log("info", f"Pulling docker image: {image}")
         try:
-            # First attempt: 120s timeout
-            subprocess.run(["docker","pull",image], capture_output=True, text=True, timeout=120, check=True)
+            # First attempt: short timeout
+            subprocess.run(["docker", "pull", image],
+                           capture_output=True, text=True, timeout=120, check=True)
             return True
         except subprocess.TimeoutExpired:
-            if not quiet:
-                log("warn", f"docker pull {image} timed out after 120s, retrying with 300s...")
-            try:
-                # Retry: 300s timeout
-                subprocess.run(["docker","pull",image], capture_output=True, text=True, timeout=300, check=True)
-                return True
-            except Exception as retry_err:
-                if not quiet:
-                    log("err", f"docker pull {image} retry failed: {retry_err}")
-                return False
-        except subprocess.CalledProcessError as pull_err:
-            if not quiet:
-                details = _coerce_subprocess_text(getattr(pull_err, "stderr", "")) or _coerce_subprocess_text(getattr(pull_err, "stdout", ""))
-                details = details.strip()
-                if details:
-                    log("err", f"docker pull {image} failed (rc={pull_err.returncode}): {details}")
-                else:
-                    log("err", f"docker pull {image} failed (rc={pull_err.returncode})")
+            log("warn", f"docker pull {image} timed out (120s), retrying...")
+        except subprocess.CalledProcessError as e:
+            log("warn", f"docker pull {image} failed first attempt, retrying...")
+
+        # Retry with longer timeout
+        try:
+            subprocess.run(["docker", "pull", image],
+                           capture_output=True, text=True, timeout=300, check=True)
+            return True
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as e:
+            log("err", f"docker pull {image} failed both attempts")
             return False
         except Exception as e:
-            if not quiet:
-                log("err", f"docker pull {image} failed: {e}")
+            log("err", f"docker pull {image} error: {e}")
             return False
     except Exception:
         return False
@@ -692,6 +688,17 @@ def ensure_nuclei_templates(plan: Optional[ToolPlan]):
     event.wait()
     return bool(NUCLEI_TEMPLATE_RESULT)
 
+def _nuclei_template_mount() -> tuple[str, str]:
+    """Return the host/container mount used for nuclei template persistence."""
+    template_dir = os.path.expanduser("~/.cache/vulnmalper/nuclei-templates")
+    try:
+        os.makedirs(template_dir, exist_ok=True)
+    except Exception:
+        # Fall back to a user-specific temp dir if the cache path is not writable.
+        template_dir = os.path.join(tempfile.gettempdir(), f"vulnmalper_nuclei_{os.getuid()}")
+        os.makedirs(template_dir, exist_ok=True)
+    return (template_dir, "/root/nuclei-templates")
+
 def warm_phase0_nmap_image():
     """Background-pull the Phase 0 nmap image when Docker fallback is needed."""
     global PHASE0_NMAP_EVENT
@@ -757,6 +764,17 @@ def _run(cmd, timeout, stdin_data: Optional[str] = None):
     except Exception as e:
         return 1, "", f"{cmd_text}: {e}" if cmd_text else str(e)
 
+def _first_human_line(text: str) -> str:
+    """Return the first non-empty, non-JSON-looking line from a blob."""
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("{") or line.startswith("["):
+            continue
+        return line
+    return ""
+
 def build_cmd(plan: ToolPlan, tool_args: list[str],
               mount: Optional[tuple[str,str]] = None,
               extra_docker: Optional[list[str]] = None,
@@ -783,7 +801,6 @@ def ensure_wordlist(name: str, url: str) -> str:
     if os.path.exists(path) and os.path.getsize(path) > 0:
         return path
     log("info", f"Downloading wordlist: {name} ...")
-    import urllib.request
     try:
         urllib.request.urlretrieve(url, path)
         return path
@@ -1267,6 +1284,7 @@ def run_nuclei(t: WebTarget, plan: ToolPlan, severity: str, timeout: int):
             "-H", f"User-Agent: {STEALTH.pick_ua()}"]
     if t.scheme != "https":
         args += ["-ept", "ssl,tls,dns"]
+    args += ["-retries", "2", "-mhe", "30"]
     auth_hdr = auth_basic_header()
     if auth_hdr:
         args += ["-H", auth_hdr]
@@ -1278,17 +1296,7 @@ def run_nuclei(t: WebTarget, plan: ToolPlan, severity: str, timeout: int):
     # Handle template persistence for Docker
     nuclei_mount = None
     if plan.runner == "docker":
-        # Use a user-specific path to avoid permission issues in /tmp
-        # and ensure templates persist across reboots unlike /tmp.
-        template_dir = os.path.expanduser("~/.cache/vulnmalper/nuclei-templates")
-        try:
-            os.makedirs(template_dir, exist_ok=True)
-        except Exception:
-            # Fallback to a user-specific temp dir if ~/.cache is not writable
-            template_dir = os.path.join(tempfile.gettempdir(), f"vulnmalper_nuclei_{os.getuid()}")
-            os.makedirs(template_dir, exist_ok=True)
-
-        nuclei_mount = (template_dir, "/root/nuclei-templates")
+        nuclei_mount = _nuclei_template_mount()
         ok = ensure_nuclei_templates(plan)
         if not ok:
             log("warn", "nuclei: template update was incomplete/failed, using existing or default set")
@@ -1305,9 +1313,6 @@ def run_nuclei(t: WebTarget, plan: ToolPlan, severity: str, timeout: int):
         # Spread the rate over a longer window so bursts smooth out.
         # nuclei -rate-limit-duration accepts Go duration: "2s","5s",...
         args += ["-rate-limit-duration", "5s" if STEALTH.slow else "2s"]
-        # Skip a host if it 30x-errors before that, or we waste budget.
-        args += ["-mhe", "30"]
-
     # ── Quiet template set: exclude noisy/intrusive tags + redundant globs.
     # The curated tag list above is the primary filter; these are extra
     # reductions when the user explicitly asked for quieter probing.
@@ -1358,8 +1363,8 @@ def run_nuclei(t: WebTarget, plan: ToolPlan, severity: str, timeout: int):
     else:
         log("warn", f"nuclei failed rc={rc} for {t.url}")
         if err:
-            # Only log the last few lines or interesting error bits
-            log("warn", f"nuclei stderr: {err.strip().splitlines()[-1] if err.strip() else 'no output'}")
+            snippet = _first_human_line(err) or _first_human_line(out) or "no human-readable output"
+            log("warn", f"nuclei stderr: {snippet[:240]}")
 
     for line in out.splitlines():
         line = line.strip()
@@ -1390,31 +1395,35 @@ def run_wapiti(t: WebTarget, plan: ToolPlan, timeout: int):
     host_dir = f"/tmp/vulnmalper_wapiti_{abs(hash(t.url))}"
     os.makedirs(host_dir, exist_ok=True)
     report = "report.json"
+    parsed_t = urllib.parse.urlparse(t.url)
+    base_url = f"{parsed_t.scheme}://{parsed_t.netloc}"
+    scope = "page" if t.discovered else "folder"
+
     extra = ["-A", STEALTH.pick_ua()]
     for h in STEALTH.default_headers():
         extra += ["-H", h]
-    # NOTE: Wapiti doesn't expose a true per-request delay flag. Do not map
-    # STEALTH delay to `-t` (request timeout), that would silently change
-    # timeout behavior instead of pacing.
-    # Headless / SPA crawling: wapiti has no built-in headless browser
-    # (NB: lynx is text-only, can't execute JS either — both are dead ends
-    # for SPAs like Juice Shop). What we CAN do is bump scope to "domain"
-    # and increase depth so wapiti follows every API call discovered by
-    # nuclei's headless crawl (which feeds t.injectable upstream).
+
+    extra += [
+        "--scope", scope,
+        "--base", base_url,
+        "--max-links-per-page", "100",
+        "-t", "10",       # per-request timeout (was default 6)
+    ]
+
+    # Seed with upstream-discovered endpoints so wapiti
+    # doesn't start blind on sparse homepages
+    for seed in (t.injectable or [])[:15]:
+        if seed.startswith("http"):
+            extra += ["--start", seed]
+
     if STEALTH.headless:
         extra += ["--scope", "domain", "-d", "5"]
-        # Seed wapiti with API endpoints nuclei's headless run already found.
-        for inj_url in t.injectable[:20]:
-            extra += ["--start", inj_url]
+
     extra += ["--module", "csrf,xss,sql,xxe,redirect,ssrf,timesql,blindsql,wapp,nikto,htaccess,cookieflags,csp,headers,http_headers"]
-    
-    # Seed wapiti with URLs ffuf/feroxbuster/nikto/nuclei already discovered
-    for seed in t.injectable[:10]:
-        extra += ["--start", seed]
-    extra += ["--max-links-per-page", "100", "--scope", "folder" if not t.discovered else "page"]
 
     if AUTH.user and AUTH.password:
-        extra += ["--auth-credential", f"{AUTH.user}%{AUTH.password}", "--auth-method", "post"]
+        extra += ["--auth-credential", f"{AUTH.user}%{AUTH.password}",
+                  "--auth-method", "post"]
     if AUTH.cookie:
         extra += ["--cookie", AUTH.cookie]
     if plan.runner == "docker":
@@ -1639,7 +1648,11 @@ def run_crawler(t: WebTarget, plan: Optional[ToolPlan], timeout: int) -> list[st
 
 def _normalize_discovered_url(u: str) -> str:
     try:
-        return _normalize_url(u)
+        n = _normalize_url(u)
+        # strip trailing /. that ffuf sometimes returns
+        if n.endswith("/."):
+            n = n[:-2] + "/"
+        return n
     except Exception:
         return u
 
@@ -1697,14 +1710,17 @@ def run_nmap_nse(asset: ServiceTarget, scripts: tuple[str, ...], timeout: int) -
                 ))
     return findings
 
-def run_service_nuclei(asset: ServiceTarget, plan: ToolPlan, timeout: int) -> list[Finding]:
+def run_service_nuclei(asset: ServiceTarget, plan: ToolPlan, timeout: int, severity: str) -> list[Finding]:
     tags = _service_scan_tags(asset)
     if not tags:
         return []
+    sev_chain = ["info","low","medium","high","critical"]
+    keep = sev_chain[max(0, sev_chain.index(severity)):] if severity in sev_chain else sev_chain
     rl = STEALTH.polite_rl(50)
     url = _service_target_url(asset)
     args = ["-u", url, "-jsonl", "-silent", "-nc",
             "-tags", ",".join(tags),
+            "-severity", ",".join(keep),
             "-exclude-tags", "fuzzing,dos,helpers",
             "-stats",
             "-timeout", "10", "-rl", str(rl),
@@ -1715,7 +1731,13 @@ def run_service_nuclei(asset: ServiceTarget, plan: ToolPlan, timeout: int) -> li
         args += ["-H", auth_basic_header()]
     if auth_cookie_value():
         args += ["-H", f"Cookie: {auth_cookie_value()}"]
-    cmd = build_cmd(plan, args)
+    nuclei_mount = None
+    if plan.runner == "docker":
+        nuclei_mount = _nuclei_template_mount()
+        ok = ensure_nuclei_templates(plan)
+        if not ok:
+            log("warn", "nuclei: template update was incomplete/failed, using existing or default set")
+    cmd = build_cmd(plan, args, mount=nuclei_mount)
     rc, out, err = _run(cmd, timeout)
     findings: list[Finding] = []
     for line in out.splitlines():
@@ -1738,7 +1760,7 @@ def run_service_nuclei(asset: ServiceTarget, plan: ToolPlan, timeout: int) -> li
         ))
     return findings
 
-def run_phase0_service_scan(service_targets: list[ServiceTarget], plans: dict[str, Optional[ToolPlan]], timeout: int = 300, nuclei_timeout: Optional[int] = 300) -> list[Finding]:
+def run_phase0_service_scan(service_targets: list[ServiceTarget], plans: dict[str, Optional[ToolPlan]], timeout: int = 300, nuclei_timeout: Optional[int] = 300, severity: str = "low") -> list[Finding]:
     findings: list[Finding] = []
     if not service_targets:
         return findings
@@ -1749,7 +1771,7 @@ def run_phase0_service_scan(service_targets: list[ServiceTarget], plans: dict[st
     for asset in service_plans:
         spec = SERVICE_SCAN_PLANS.get(asset.port, {})
         if spec.get("nuclei") and plans.get("nuclei"):
-            findings.extend(run_service_nuclei(asset, plans["nuclei"], nuclei_timeout))
+            findings.extend(run_service_nuclei(asset, plans["nuclei"], nuclei_timeout, severity))
         if spec.get("nmap"):
             findings.extend(run_nmap_nse(asset, tuple(spec.get("nmap_scripts") or ()), timeout))
     return findings
@@ -1861,7 +1883,6 @@ SERVICE_CHAIN_PLAYBOOKS: dict[int, dict] = {
 def _http_probe(url: str, timeout: int = 10) -> tuple[int, str]:
     """Tiny stdlib HTTP GET — avoids pulling `requests` just for chaining.
     Returns (status_code, body_first_4kb). status=0 on connection failure."""
-    import urllib.request, urllib.error, ssl
     headers = {"User-Agent": STEALTH.pick_ua()}
     for h in STEALTH.default_headers():
         if ":" in h:
@@ -1890,6 +1911,110 @@ def _tcp_probe(host: str, port: int, timeout: int = 4) -> bool:
             return True
     except Exception:
         return False
+
+def discover_forms(url: str) -> list[dict]:
+    """Fetch a page and extract all forms with real field names and action URLs."""
+
+    class FormParser(html.parser.HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.forms = []
+            self.current_form = None
+
+        def handle_starttag(self, tag, attrs):
+            attrs = dict(attrs)
+            if tag == "form":
+                self.current_form = {
+                    "action": attrs.get("action", ""),
+                    "method": attrs.get("method", "get").lower(),
+                    "fields": {}
+                }
+            elif tag == "input" and self.current_form is not None:
+                name = attrs.get("name")
+                val = attrs.get("value", "test")
+                typ = attrs.get("type", "text").lower()
+                if name and typ not in ("submit", "button", "image", "reset", "hidden"):
+                    self.current_form["fields"][name] = val or "test"
+            elif tag == "textarea" and self.current_form is not None:
+                name = attrs.get("name")
+                if name:
+                    self.current_form["fields"][name] = "test"
+            elif tag == "select" and self.current_form is not None:
+                name = attrs.get("name")
+                if name:
+                    self.current_form["fields"][name] = "1"
+
+        def handle_endtag(self, tag):
+            if tag == "form" and self.current_form:
+                if self.current_form["fields"]:
+                    self.forms.append(self.current_form)
+                self.current_form = None
+
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    req = urllib.request.Request(url, headers={"User-Agent": STEALTH.pick_ua()})
+    try:
+        with urllib.request.urlopen(req, timeout=10, context=ctx) as r:
+            body = r.read(50000).decode("utf-8", errors="replace")
+    except Exception:
+        return []
+
+    parser = FormParser()
+    try:
+        parser.feed(body)
+    except Exception:
+        return []
+    return parser.forms
+
+
+def build_sqlmap_targets(t: "WebTarget") -> list[tuple[str, str, str]]:
+    """
+    Returns list of (url, post_data, method).
+    Discovers real form fields rather than guessing param names.
+    """
+    targets: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+
+    forms = discover_forms(t.url)
+    for form in forms:
+        action = form["action"].strip()
+        if action.startswith("http"):
+            action_url = action
+        elif action.startswith("/"):
+            action_url = f"{t.scheme}://{t.host}{action}"
+        elif action in ("", "#"):
+            action_url = t.url
+        else:
+            action_url = t.url.rstrip("/") + "/" + action
+
+        method = form["method"]
+        post_data = urllib.parse.urlencode(form["fields"]) if method == "post" else ""
+        get_suffix = ("?" + urllib.parse.urlencode(form["fields"])) if method == "get" and form["fields"] else ""
+        final_url = action_url + get_suffix
+
+        key = f"{final_url}|{post_data}"
+        if key not in seen:
+            seen.add(key)
+            targets.append((final_url, post_data, method))
+
+    # Add upstream-flagged injectable URLs (from nuclei/nikto) with value=1
+    for u in t.injectable:
+        if "?" not in u:
+            continue
+        # Ensure params have a value
+        base, qs = u.split("?", 1)
+        fixed_qs = "&".join(
+            (p if "=" in p and p.split("=", 1)[1] else p.split("=")[0] + "=1")
+            for p in qs.split("&") if p
+        )
+        fixed_url = base + "?" + fixed_qs
+        key = f"{fixed_url}|"
+        if key not in seen:
+            seen.add(key)
+            targets.append((fixed_url, "", "get"))
+
+    return targets
 
 def confirm_target_liveness(t: WebTarget) -> bool:
     """Double-check a target before considering it dead.
@@ -1967,7 +2092,6 @@ def _probe_response_headers(url: str, timeout: int = 6) -> dict:
     """Single GET, return the response headers as a lowercased dict.
     Uses the active stealth headers so we look like a normal browser to
     the WAF too — otherwise a curl-shaped probe might itself flag us."""
-    import urllib.request, urllib.error, ssl
     headers = {"User-Agent": STEALTH.pick_ua()}
     for h in STEALTH.default_headers():
         if ":" in h:
@@ -2163,184 +2287,74 @@ def run_service_chain(t: WebTarget, timeout: int = 15) -> list[Finding]:
                 t.injectable.append(url)
     return findings
 
-# ────────────────────────────────────────────────────────────────────────────
-def discover_forms(url: str) -> list[dict]:
-    """Fetch a page and extract all forms with their fields and action URLs."""
-    import urllib.request, urllib.error, ssl, html.parser
-
-    class FormParser(html.parser.HTMLParser):
-        def __init__(self):
-            super().__init__()
-            self.forms = []
-            self.current_form = None
-
-        def handle_starttag(self, tag, attrs):
-            attrs = dict(attrs)
-            if tag == "form":
-                self.current_form = {
-                    "action": attrs.get("action", ""),
-                    "method": attrs.get("method", "get").lower(),
-                    "fields": {}
-                }
-            elif tag == "input" and self.current_form is not None:
-                name = attrs.get("name")
-                val = attrs.get("value", "test")
-                typ = attrs.get("type", "text").lower()
-                if name and typ not in ("submit", "button", "image", "reset"):
-                    self.current_form["fields"][name] = val or "test"
-            elif tag == "textarea" and self.current_form is not None:
-                name = attrs.get("name")
-                if name:
-                    self.current_form["fields"][name] = "test"
-
-        def handle_endtag(self, tag):
-            if tag == "form" and self.current_form:
-                self.forms.append(self.current_form)
-                self.current_form = None
-
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    req = urllib.request.Request(url, headers={"User-Agent": STEALTH.pick_ua()})
-    try:
-        with urllib.request.urlopen(req, timeout=10, context=ctx) as r:
-            body = r.read(50000).decode("utf-8", errors="replace")
-    except Exception:
-        return []
-
-    parser = FormParser()
-    parser.feed(body)
-    return parser.forms
-
-def build_sqlmap_targets(t: WebTarget) -> list[tuple[str, str, str]]:
-    """Returns list of (url, post_data, method) tuples."""
-    targets = []
-
-    # Discover real forms on this page
-    forms = discover_forms(t.url)
-    for form in forms:
-        action = form["action"]
-        if action.startswith("http"):
-            action_url = action
-        elif action.startswith("/"):
-            action_url = f"{t.scheme}://{t.host}{action}"
-        elif action == "" or action == "#":
-            action_url = t.url
-        else:
-            action_url = t.url.rstrip("/") + "/" + action
-
-        post_data = urllib.parse.urlencode(form["fields"]) if form["fields"] else ""
-        method = form["method"]
-        targets.append((action_url, post_data if method == "post" else "", method))
-
-    # Also add any upstream-flagged injectable URLs (from nuclei/nikto)
-    for u in t.injectable:
-        if "?" in u and not any(u == x[0] for x in targets):
-            targets.append((u, "", "get"))
-
-    return targets
-
 # ── PHASE 3 — VERIFY (sqlmap, only on endpoints upstream flagged)
 # ────────────────────────────────────────────────────────────────────────────
-def run_sqlmap(url: str, plan: ToolPlan, timeout: int, post_data: str = "", cookie: str = ""):
+def run_sqlmap(url: str, plan: ToolPlan, timeout: int,
+               post_data: str = "", cookie: str = "",
+               waf_detected: bool = False):
     host_dir = f"/tmp/vulnmalper_sqlmap_{abs(hash(url))}"
     os.makedirs(host_dir, exist_ok=True)
     ua = STEALTH.pick_ua()
     stealth_sqlmap = STEALTH.polite or STEALTH.slow or STEALTH.quiet
-    level = SQLMAP_LEVEL if SQLMAP_LEVEL is not None else (1 if stealth_sqlmap else 3)
+
+    level = SQLMAP_LEVEL if SQLMAP_LEVEL is not None else (1 if stealth_sqlmap else 4)
     risk  = SQLMAP_RISK  if SQLMAP_RISK  is not None else (1 if stealth_sqlmap else 2)
+
     extra = ["--user-agent", ua, "--level", str(level), "--risk", str(risk)]
 
-    # sqlmap accepts a single --headers="K1: V1\nK2: V2" string
-    hdrs = STEALTH.default_headers()
-    cookie_val = cookie or auth_cookie_value()
+    # Tamper scripts: minimal on clean targets, evasion-focused on WAF targets
+    if waf_detected:
+        tamper_scripts = ["between", "charencode", "space2comment", "randomcase"]
+    else:
+        tamper_scripts = ["between", "space2comment"]
+    extra += ["--tamper", ",".join(tamper_scripts)]
 
-    # Add cookie flag if provided
+    # Headers
+    cookie_val = cookie or auth_cookie_value()
     if cookie_val:
         extra += ["--cookie", cookie_val]
 
+    hdrs = STEALTH.default_headers()
     if hdrs:
         extra += ["--headers", "\n".join(hdrs)]
 
-    # WAF evasion: enhanced tamper scripts for UNION, error-based, and blind SQLi
-    tamper_scripts = [
-        "between",           # SQL syntax alterations (greater/less than)
-        "charencode",        # Character encoding
-        "charunicodeencode", # Unicode encoding
-        "space2comment",    # Comment replacement
-        "lowercase",        # Keyword case variation
-        "space2hash",       # Random space to HASH comment
-        "space2dash",       # Random space to DASH comment
-        "ifstring2iftag",  # IF string to IF tag
-        "modsecurityversioned", # Versioned comment
-        "xforwardedfor",   # X-Forwarded-For spoofing
-    ]
-    extra += ["--tamper", ",".join(tamper_scripts)]
-
-    # PROJECT-WIDE EVASION: Use our pinned UA and other evasion headers
-    # We explicitly EXCLUDE --random-agent because it would override our 
-    # chosen UA with sqlmap's own internal (often outdated) pool.
-    extra += ["--forms"]
-
-    # Add POST data if provided for form-based SQLi, and merge auth creds
-    # into the same body when they are supplied.
+    # POST data + auth merge
     form_data = post_data or ""
     if AUTH.user and AUTH.password:
         form_data = merge_form_data(form_data, auth_form_data())
     if form_data:
         extra += ["--data", form_data]
 
-    # Blind SQLi specific: add time-delay for boolean-based detection
+    # Techniques
+    extra += ["--technique", "BEUSTQ"]
+
+    # Delays
     if STEALTH.polite or STEALTH.slow:
         d = max(1, int(STEALTH.polite_delay(500) / 1000))
         extra += ["--delay", str(d), "--safe-freq", "5"]
     else:
-        # Small delay even in aggressive mode to avoid instant WAF blocks
-        extra += ["--delay", "0.5", "--safe-freq", "3"]
+        extra += ["--delay", "0", "--safe-freq", "3"]
 
-    # Enhanced techniques: include all SQLi types
-    # B=Boolean-based blind, E=Error-based, U=Union, S=Stacked, T=Time-based, Q=Inline query
-    extra += ["--technique", "BEUSTQ"]
-    
-    # For demo/vulnerable targets, be more aggressive
-    # Skip smart mode, go straight to full scan
-    # extra += ["--smart"]  # Keep smart but combine with other options
-    
-    # No prompt for user interaction
-    extra += ["--batch", "--non-interactive"]
+    # No prompts
+    extra += ["--batch", "--non-interactive", "--forms"]
 
     if plan.runner == "docker":
         container_dir = "/wrk"
         args = ["-u", url, "--disable-coloring",
                 "--output-dir", container_dir,
-                "--timeout","30","--retries","3"] + extra
+                "--timeout", "30", "--retries", "3"] + extra
         cmd = build_cmd(plan, args, mount=(host_dir, container_dir))
     else:
         args = ["-u", url, "--disable-coloring",
                 "--output-dir", host_dir,
-                "--timeout","30","--retries","3"] + extra
+                "--timeout", "30", "--retries", "3"] + extra
         cmd = build_cmd(plan, args)
 
-    # Log the command for debugging
     log("run", f"sqlmap: {' '.join(cmd[:8])}...")
-
     rc, out, err = _run(cmd, timeout)
     findings: list[Finding] = []
     text = out + "\n" + err
 
-    # Enhanced error detection and logging
-    error_patterns = {
-        "waf": r"(blocked|detected|waf|firewall|protection)",
-        "timeout": r"(timeout|timed out)",
-        "connection": r"(connection refused|reset|failed)",
-        "rate_limit": r"(rate limit|too many requests)",
-    }
-
-    for pattern_name, pattern in error_patterns.items():
-        if re.search(pattern, text, re.I):
-            log("warn", f"sqlmap: {pattern_name} issue detected for {url}")
-
-    # Extract SQLi findings with enhanced parsing
     blocks = re.findall(
         r"Parameter:\s*(.+?)\n\s*Type:\s*(.+?)\n\s*Title:\s*(.+?)\n\s*Payload:\s*(.+?)(?:\n\s*\n|\Z)",
         text, re.S,
@@ -2353,29 +2367,15 @@ def run_sqlmap(url: str, plan: ToolPlan, timeout: int, post_data: str = "", cook
             reference="https://owasp.org/www-community/attacks/SQL_Injection",
         ))
 
-    # Also capture findings from other sqlmap output formats
-    # Extract "it looks like the back-end DBMS" type findings
-    dbms_match = re.search(r"it looks like the back-end DBMS is '(.+?)'", text, re.I)
-    if dbms_match:
-        log("info", f"sqlmap: detected DBMS as {dbms_match.group(1)} for {url}")
-
-    # Extract any "vulnerability(ies) found" message
-    vuln_match = re.search(r"(\d+) vulnerability(?:ies)? found", text, re.I)
-    if vuln_match and int(vuln_match.group(1)) > 0:
-        log("ok", f"sqlmap: found {vuln_match.group(1)} vulnerability(ies) on {url}")
-
-    # Enhanced SQLi detection: check if sqlmap created a log file for this target,
-    # which is a reliable indicator that it found something.
     target_host = urllib.parse.urlparse(url).hostname or "target"
     log_file = os.path.join(host_dir, target_host, "log")
-    if os.path.exists(log_file) and os.path.getsize(log_file) > 0:
-        if not findings:
-            findings.append(Finding(
-                target=url, tool="sqlmap", severity="critical",
-                title="SQL Injection Detected (verified via log)",
-                detail="sqlmap confirmed the target is injectable. See full tool logs for payloads.",
-                reference="https://owasp.org/www-community/attacks/SQL_Injection",
-            ))
+    if os.path.exists(log_file) and os.path.getsize(log_file) > 0 and not findings:
+        findings.append(Finding(
+            target=url, tool="sqlmap", severity="critical",
+            title="SQL Injection Detected (verified via log)",
+            detail="sqlmap confirmed injectable. Check tool logs for payloads.",
+            reference="https://owasp.org/www-community/attacks/SQL_Injection",
+        ))
 
     shutil.rmtree(host_dir, ignore_errors=True)
     return findings
@@ -3041,13 +3041,18 @@ def main():
                         f"→ {secs}s ({secs//60}min) each")
 
     all_findings: list[Finding] = []
+    t0 = time.time()
     if service_targets:
         _phase("Phase 0 — Service Vulnerability Scanning")
         log("info", f"🔧 Service scan — {len(service_targets)} non-web services found")
-        service_findings = run_phase0_service_scan(service_targets, plans, timeout=300, nuclei_timeout=timeouts["nuclei"])
+        service_findings = run_phase0_service_scan(
+            service_targets,
+            plans,
+            timeout=300,
+            nuclei_timeout=timeouts["nuclei"],
+            severity=args.severity,
+        )
         all_findings.extend(service_findings)
-
-    t0 = time.time()
 
     # ── PHASE 1: fingerprint ───────────────────────────────────────────────
     _phase("Phase 1 — Fingerprinting (httpx, whatweb, wafw00f)")
@@ -3277,13 +3282,20 @@ def main():
 
             # nuclei on all HTTP targets (run first — most valuable)
             if plans["nuclei"]:
-                log("run", f"nuclei ({plans['nuclei'].runner}) → {t.url}")
-                tt = time.time()
-                fs = run_nuclei(t, plans["nuclei"], args.severity, timeouts["nuclei"])
-                log("ok" if fs else "skip",
-                    f"  nuclei {round(time.time()-tt,1)}s — {len(fs)} findings")
-                out.extend(fs)
-                STEALTH.sleep_jitter()  # avoid burst pattern between tools
+                SKIP_NUCLEI_EXT = {".css", ".js", ".png", ".jpg", ".jpeg",
+                                   ".gif", ".ico", ".svg", ".woff", ".woff2",
+                                   ".ttf", ".eot", ".txt", ".xml", ".pdf"}
+                _ext = os.path.splitext(urllib.parse.urlparse(t.url).path)[1].lower()
+                if _ext in SKIP_NUCLEI_EXT:
+                    log("skip", f"nuclei → {t.url} (static file)")
+                else:
+                    log("run", f"nuclei ({plans['nuclei'].runner}) → {t.url}")
+                    tt = time.time()
+                    fs = run_nuclei(t, plans["nuclei"], args.severity, timeouts["nuclei"])
+                    log("ok" if fs else "skip",
+                        f"  nuclei {round(time.time()-tt,1)}s — {len(fs)} findings")
+                    out.extend(fs)
+                    STEALTH.sleep_jitter()  # avoid burst pattern between tools
 
             # ── Slower / lower-priority scanners ──────────────────────
 
@@ -3359,36 +3371,58 @@ def main():
     _phase("Phase 3 — Verifying SQLi candidates (sqlmap)")
 
     sqli_queue: list[tuple[str, str]] = []  # (url, post_data)
+    seen_sqli: set[str] = set()
+
     for t in targets:
         if auto_mode:
             strategy, reason = _ensure_auto_strategy(t)
             if strategy == "stealth":
-                if t.injectable:
-                    log("skip", f"sqlmap candidates on {t.url} skipped in auto stealth mode ({reason})")
+                if t.injectable or t.alive:
+                    log("skip", f"sqlmap on {t.url} skipped — auto stealth ({reason})")
                 continue
+
+        # Skip static files
+        _ext = os.path.splitext(urllib.parse.urlparse(t.url).path)[1].lower()
+        if _ext in {".css", ".js", ".png", ".jpg", ".gif", ".ico",
+                    ".txt", ".xml", ".svg", ".woff", ".ttf"}:
+            continue
+
         for url, post_data, method in build_sqlmap_targets(t):
-            if (url, post_data) not in sqli_queue:
+            key = f"{url}|{post_data}"
+            if key not in seen_sqli:
+                seen_sqli.add(key)
                 sqli_queue.append((url, post_data))
 
     if not plans["sqlmap"]:
         log("skip", "sqlmap unavailable — skipping phase 3")
     elif not sqli_queue:
-        log("skip", "No injectable endpoints surfaced by upstream tools")
+        log("skip", "No injectable endpoints found by form discovery or upstream tools")
     else:
-        log("info", f"{len(sqli_queue)} endpoint(s) flagged for sqlmap verification:")
-        for u, pd in sqli_queue: print(f"  {C.GY}•{C.R} {u}")
-        def _sqli_worker(item):
+        log("info", f"{len(sqli_queue)} endpoint(s) queued for sqlmap:")
+        for u, pd in sqli_queue:
+            method_label = "POST" if pd else "GET"
+            log("info", f"  [{method_label}] {u}" + (f" data={pd[:60]}" if pd else ""))
+
+        def _sqli_worker(item: tuple[str, str]):
             url, post_data = item
+            # pass waf_detected so tamper selection is smart
+            waf = any(t.waf for t in targets
+                      if t.url.startswith(f"{urllib.parse.urlparse(url).scheme}://"
+                                          f"{urllib.parse.urlparse(url).netloc}"))
             log("run", f"sqlmap ({plans['sqlmap'].runner}) → {url}")
             tt = time.time()
-            fs = run_sqlmap(url, plans["sqlmap"], timeouts["sqlmap"], post_data=post_data)
+            fs = run_sqlmap(url, plans["sqlmap"], timeouts["sqlmap"],
+                            post_data=post_data, waf_detected=bool(waf))
             log("ok" if fs else "skip",
                 f"  sqlmap {round(time.time()-tt,1)}s — {len(fs)} findings")
             return fs
+
         if args.threads <= 1:
-            for item in sqli_queue: all_findings.extend(_sqli_worker(item))
+            for item in sqli_queue:
+                all_findings.extend(_sqli_worker(item))
         else:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(args.threads,3)) as ex:
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=min(args.threads, 3)) as ex:
                 for fs in ex.map(_sqli_worker, sqli_queue):
                     all_findings.extend(fs)
 
