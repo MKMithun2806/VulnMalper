@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VulnMalper v7.2.6  —  Vulnerability pipeline for NetMalper graphs.
+VulnMalper v7.2.8  —  Vulnerability pipeline for NetMalper graphs.
 
 Pipeline:
     NetMalper JSON
@@ -54,7 +54,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-VERSION = "7.2.6"
+VERSION = "7.2.8"
 
 # Background warmup state for docker images and nuclei templates.
 DOCKER_IMAGE_EVENTS: dict[str, threading.Event] = {}
@@ -806,6 +806,92 @@ def _first_human_line(text: str) -> str:
         return line
     return ""
 
+def _summarize_nuclei_stats(text: str) -> str:
+    """Turn nuclei progress snapshots into a compact one-line summary."""
+    latest: dict[str, object] = {}
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if not line.startswith("{"):
+            continue
+        try:
+            payload = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(payload, dict):
+            latest = payload
+
+    if not latest:
+        return _first_human_line(text)
+
+    preferred = ("duration", "requests", "matched", "errors", "rps", "percent")
+    bits = [f"{key}={latest[key]}" for key in preferred if key in latest]
+    if bits:
+        return "nuclei stats: " + " ".join(bits)
+
+    return _first_human_line(text)
+
+def _load_json_document(text: str):
+    """Parse a JSON document, with a line-by-line fallback for tool output."""
+    blob = (text or "").strip()
+    if not blob:
+        return None
+    try:
+        return json.loads(blob)
+    except Exception:
+        pass
+    for raw in blob.splitlines():
+        line = raw.strip()
+        if not line or not line.startswith(("{", "[")):
+            continue
+        try:
+            return json.loads(line)
+        except Exception:
+            continue
+    return None
+
+def _iter_wapiti_vulnerabilities(payload):
+    """Yield (category, item) pairs from a wapiti JSON payload."""
+    if isinstance(payload, dict):
+        vulns = payload.get("vulnerabilities", payload)
+    else:
+        vulns = payload
+
+    if isinstance(vulns, dict):
+        items_iter = vulns.items()
+    elif isinstance(vulns, list):
+        items_iter = enumerate(vulns)
+    else:
+        return
+
+    for category, items in items_iter:
+        if isinstance(items, dict):
+            items = [items]
+        elif not isinstance(items, list):
+            continue
+        for item in items:
+            if isinstance(item, dict):
+                yield str(category), item
+
+def _same_netloc(candidate: str, base: str) -> bool:
+    """True when both URLs resolve to the same network location."""
+    try:
+        c = urllib.parse.urlparse(candidate)
+        b = urllib.parse.urlparse(base)
+        return bool(c.netloc) and c.netloc == b.netloc
+    except Exception:
+        return False
+
+def _looks_like_advisory_path(path: str) -> bool:
+    """Reject path fragments that are clearly embedded absolute URLs."""
+    try:
+        frag = path.lstrip("/")
+        first_seg = frag.split("/", 1)[0]
+        return "/" in frag and "." in first_seg
+    except Exception:
+        return False
+
 def build_cmd(plan: ToolPlan, tool_args: list[str],
               mount: Optional[tuple[str,str]] = None,
               extra_docker: Optional[list[str]] = None,
@@ -1287,8 +1373,16 @@ def run_nikto(t: WebTarget, plan: ToolPlan, timeout: int):
         for tok in msg.replace(":", " ").split():
             tok = tok.rstrip(".,);")
             if tok.startswith(("http://", "https://")) and "?" in tok:
+                parsed = urllib.parse.urlparse(tok)
+                base = urllib.parse.urlparse(t.url)
+                if parsed.netloc and parsed.netloc != base.netloc:
+                    continue
                 cand = tok
             elif tok.startswith("/") and "?" in tok:
+                path_part = tok.split("?", 1)[0].lstrip("/")
+                first_seg = path_part.split("/", 1)[0]
+                if "/" in path_part and "." in first_seg:
+                    continue
                 cand = t.url.rstrip("/") + tok
             else:
                 continue
@@ -1311,11 +1405,10 @@ def run_nuclei(t: WebTarget, plan: ToolPlan, severity: str, timeout: int):
             "-severity", ",".join(keep),
             "-exclude-tags", "fuzzing,dos,helpers",
             "-stats",
-            "-v",
             "-timeout","15","-retries","2","-rl",str(rl),
             "-H", f"User-Agent: {STEALTH.pick_ua()}"]
     if t.scheme != "https":
-        args += ["-ept", "ssl,tls,dns"]
+        args += ["-ept", "ssl,dns"]
     args += ["-retries", "2", "-mhe", "30"]
     auth_hdr = auth_basic_header()
     if auth_hdr:
@@ -1382,15 +1475,12 @@ def run_nuclei(t: WebTarget, plan: ToolPlan, severity: str, timeout: int):
             log("info", f"nuclei: got {len(json_lines)} JSON results from {t.url}")
         else:
             log("info", f"nuclei completed successfully (0 findings) for {t.url}")
-            # If stderr contains stats, log them as INFO instead of WARN
+            # nuclei emits progress snapshots as JSON objects on stderr.
+            # Summarize them so the CLI stays readable and no raw JSON leaks.
             if err:
-                stats = []
-                for line in err.splitlines():
-                    line = line.strip()
-                    if any(x in line.lower() for x in ["templates", "requests", "matched", "duration"]):
-                        stats.append(line)
+                stats = _summarize_nuclei_stats(err)
                 if stats:
-                    log("info", f"    {' | '.join(stats)}")
+                    log("info", f"    {stats}")
     else:
         log("warn", f"nuclei failed rc={rc} for {t.url}")
         if err:
@@ -1444,8 +1534,11 @@ def run_wapiti(t: WebTarget, plan: ToolPlan, timeout: int):
     # Seed with upstream-discovered endpoints so wapiti
     # doesn't start blind on sparse homepages
     for seed in (t.injectable or [])[:15]:
-        if seed.startswith("http"):
-            extra += ["--start", seed]
+        if not seed.startswith(("http://", "https://")):
+            continue
+        if not _same_netloc(seed, t.url):
+            continue
+        extra += ["--start", seed]
 
     if STEALTH.headless:
         extra += ["--scope", "domain", "-d", "5"]
@@ -1472,37 +1565,42 @@ def run_wapiti(t: WebTarget, plan: ToolPlan, timeout: int):
     rc, out, err = _run(cmd, timeout + 30)
     findings: list[Finding] = []
     host_out = os.path.join(host_dir, report)
+    payload = None
     if os.path.exists(host_out):
         try:
             with open(host_out) as f: data = json.load(f)
-            vulns = data.get("vulnerabilities", {}) or {}
-            for category, items in vulns.items():
-                for it in items or []:
-                    lvl = it.get("level", it.get("severity", 0))
-                    sev = WAPITI_SEV_MAP.get(lvl, "unknown")
-                    info_ = it.get("info") or it.get("description") or ""
-                    method = it.get("method") or ""
-                    path   = it.get("path") or ""
-                    param  = it.get("parameter") or it.get("parameter_name") or ""
-                    full_url = urllib.parse.urljoin(t.url, path)
-                    findings.append(Finding(
-                        target=full_url, tool="wapiti", severity=sev,
-                        title=f"{category}" + (f" on `{param}`" if param else ""),
-                        detail=(f"{method} {path}\n{info_}").strip(),
-                        raw=it,
-                    ))
-                    # Add URLs with parameters to injectable for sqlmap testing
-                    # Include SQLi, XSS, and any other parameter-based vulnerabilities
-                    if param and "?" not in full_url:
-                        injectable_url = full_url + "?" + param + "=1"
-                    elif param:
-                        injectable_url = full_url + "&" + param + "=1"
-                    else:
-                        injectable_url = full_url
-                    if injectable_url not in t.injectable:
-                        t.injectable.append(injectable_url)
+            payload = data
         except Exception as e:
             log("warn", f"wapiti JSON parse failed for {t.url}: {e}")
+    if payload is None:
+        payload = _load_json_document(out) or _load_json_document(err)
+    if payload is not None:
+        for category, it in _iter_wapiti_vulnerabilities(payload):
+            lvl = it.get("level", it.get("severity", 0))
+            sev = WAPITI_SEV_MAP.get(lvl, "unknown")
+            info_ = it.get("info") or it.get("description") or ""
+            method = it.get("method") or ""
+            path   = it.get("path") or ""
+            param  = it.get("parameter") or it.get("parameter_name") or ""
+            full_url = urllib.parse.urljoin(t.url, path)
+            findings.append(Finding(
+                target=full_url, tool="wapiti", severity=sev,
+                title=f"{category}" + (f" on `{param}`" if param else ""),
+                detail=(f"{method} {path}\n{info_}").strip(),
+                raw=it,
+            ))
+            # Add URLs with parameters to injectable for sqlmap testing.
+            # Include SQLi, XSS, and any other parameter-based vulnerabilities.
+            if not _same_netloc(full_url, t.url):
+                continue
+            if param and "?" not in full_url:
+                injectable_url = full_url + "?" + param + "=1"
+            elif param:
+                injectable_url = full_url + "&" + param + "=1"
+            else:
+                injectable_url = full_url
+            if injectable_url not in t.injectable:
+                t.injectable.append(injectable_url)
     shutil.rmtree(host_dir, ignore_errors=True)
     return findings
 
@@ -1755,7 +1853,6 @@ def run_service_nuclei(asset: ServiceTarget, plan: ToolPlan, timeout: int, sever
             "-severity", ",".join(keep),
             "-exclude-tags", "fuzzing,dos,helpers",
             "-stats",
-            "-v",
             "-timeout", "10", "-rl", str(rl),
             "-H", f"User-Agent: {STEALTH.pick_ua()}"]
     for h in STEALTH.default_headers():
@@ -2038,6 +2135,8 @@ def build_sqlmap_targets(t: "WebTarget") -> list[tuple[str, str, str]]:
     # Add upstream-flagged injectable URLs (from nuclei/nikto) with value=1
     for u in t.injectable:
         if "?" not in u:
+            continue
+        if urllib.parse.urlparse(u).netloc and not _same_netloc(u, t.url):
             continue
         # Ensure params have a value
         base, qs = u.split("?", 1)
