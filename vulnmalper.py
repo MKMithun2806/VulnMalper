@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VulnMalper v7.2.5  —  Vulnerability pipeline for NetMalper graphs.
+VulnMalper v7.2.6  —  Vulnerability pipeline for NetMalper graphs.
 
 Pipeline:
     NetMalper JSON
@@ -54,7 +54,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-VERSION = "7.2.5"
+VERSION = "7.2.6"
 
 # Background warmup state for docker images and nuclei templates.
 DOCKER_IMAGE_EVENTS: dict[str, threading.Event] = {}
@@ -690,6 +690,11 @@ def ensure_nuclei_templates(plan: Optional[ToolPlan]):
 
 def _nuclei_template_mount() -> tuple[str, str]:
     """Return the host/container mount used for nuclei template persistence."""
+    template_dir = _nuclei_template_host_dir()
+    return (template_dir, "/root/nuclei-templates")
+
+def _nuclei_template_host_dir() -> str:
+    """Return the host directory used to persist nuclei templates."""
     template_dir = os.path.expanduser("~/.cache/vulnmalper/nuclei-templates")
     try:
         os.makedirs(template_dir, exist_ok=True)
@@ -697,7 +702,33 @@ def _nuclei_template_mount() -> tuple[str, str]:
         # Fall back to a user-specific temp dir if the cache path is not writable.
         template_dir = os.path.join(tempfile.gettempdir(), f"vulnmalper_nuclei_{os.getuid()}")
         os.makedirs(template_dir, exist_ok=True)
-    return (template_dir, "/root/nuclei-templates")
+    return template_dir
+
+def _ensure_nuclei_templates_ready(plan: Optional[ToolPlan], target: str) -> bool:
+    """Wait for nuclei templates to finish refreshing and verify they exist."""
+    if not plan or plan.runner != "docker":
+        return True
+
+    ok = ensure_nuclei_templates(plan)
+    if not ok:
+        log("warn", "nuclei: template update was incomplete/failed, using existing or default set")
+
+    template_dir = _nuclei_template_host_dir()
+    try:
+        tmpl_path = Path(template_dir)
+        tmpl_count = sum(1 for _ in tmpl_path.rglob("*.yaml"))
+        if tmpl_count < 100:
+            log("warn", f"nuclei: only {tmpl_count} templates found, waiting...")
+            time.sleep(5)
+            tmpl_count = sum(1 for _ in tmpl_path.rglob("*.yaml"))
+        if tmpl_count < 100:
+            log("err", f"nuclei: template dir empty after wait, skipping {target}")
+            return False
+        log("info", f"nuclei: {tmpl_count} templates ready")
+    except Exception as e:
+        log("warn", f"nuclei: template readiness check failed for {target}: {e}")
+        return False
+    return True
 
 def warm_phase0_nmap_image():
     """Background-pull the Phase 0 nmap image when Docker fallback is needed."""
@@ -1280,6 +1311,7 @@ def run_nuclei(t: WebTarget, plan: ToolPlan, severity: str, timeout: int):
             "-severity", ",".join(keep),
             "-exclude-tags", "fuzzing,dos,helpers",
             "-stats",
+            "-v",
             "-timeout","15","-retries","2","-rl",str(rl),
             "-H", f"User-Agent: {STEALTH.pick_ua()}"]
     if t.scheme != "https":
@@ -1297,9 +1329,8 @@ def run_nuclei(t: WebTarget, plan: ToolPlan, severity: str, timeout: int):
     nuclei_mount = None
     if plan.runner == "docker":
         nuclei_mount = _nuclei_template_mount()
-        ok = ensure_nuclei_templates(plan)
-        if not ok:
-            log("warn", "nuclei: template update was incomplete/failed, using existing or default set")
+        if not _ensure_nuclei_templates_ready(plan, t.url):
+            return []
 
     # ── Stealth: smaller, smarter probing under --polite / --slow / --quiet
     # Default nuclei = 25 templates × 25 hosts in parallel = obvious burst.
@@ -1437,6 +1468,7 @@ def run_wapiti(t: WebTarget, plan: ToolPlan, timeout: int):
                 "--flush-session","--level","2",
                 "--max-scan-time", str(min(timeout, 1200)), "-S","paranoid"] + extra
         cmd = build_cmd(plan, args)
+    log("info", f"wapiti cmd: {' '.join(cmd[:12])}...")
     rc, out, err = _run(cmd, timeout + 30)
     findings: list[Finding] = []
     host_out = os.path.join(host_dir, report)
@@ -1723,6 +1755,7 @@ def run_service_nuclei(asset: ServiceTarget, plan: ToolPlan, timeout: int, sever
             "-severity", ",".join(keep),
             "-exclude-tags", "fuzzing,dos,helpers",
             "-stats",
+            "-v",
             "-timeout", "10", "-rl", str(rl),
             "-H", f"User-Agent: {STEALTH.pick_ua()}"]
     for h in STEALTH.default_headers():
@@ -1734,9 +1767,8 @@ def run_service_nuclei(asset: ServiceTarget, plan: ToolPlan, timeout: int, sever
     nuclei_mount = None
     if plan.runner == "docker":
         nuclei_mount = _nuclei_template_mount()
-        ok = ensure_nuclei_templates(plan)
-        if not ok:
-            log("warn", "nuclei: template update was incomplete/failed, using existing or default set")
+        if not _ensure_nuclei_templates_ready(plan, f"{asset.host}:{asset.port}"):
+            return []
     cmd = build_cmd(plan, args, mount=nuclei_mount)
     rc, out, err = _run(cmd, timeout)
     findings: list[Finding] = []
@@ -1987,6 +2019,11 @@ def build_sqlmap_targets(t: "WebTarget") -> list[tuple[str, str, str]]:
             action_url = t.url
         else:
             action_url = t.url.rstrip("/") + "/" + action
+
+        parsed_action = urllib.parse.urlparse(action_url)
+        parsed_base = urllib.parse.urlparse(t.url)
+        if parsed_action.netloc and parsed_action.netloc != parsed_base.netloc:
+            continue
 
         method = form["method"]
         post_data = urllib.parse.urlencode(form["fields"]) if method == "post" else ""
@@ -2336,7 +2373,7 @@ def run_sqlmap(url: str, plan: ToolPlan, timeout: int,
         extra += ["--delay", "0", "--safe-freq", "3"]
 
     # No prompts
-    extra += ["--batch", "--non-interactive", "--forms"]
+    extra += ["--batch", "--non-interactive"]
 
     if plan.runner == "docker":
         container_dir = "/wrk"
