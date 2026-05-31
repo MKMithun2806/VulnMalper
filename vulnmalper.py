@@ -399,10 +399,40 @@ def _best_hostname_for_ip(ip: str, cache: dict[str, str]) -> Optional[str]:
     return cache.get(ip)
 
 def _normalize_url(url: str) -> str:
-    """Normalize URL by ensuring consistent format without forcing slash stripping."""
-    p = urllib.parse.urlparse(url)
-    path = p.path or "/"
-    return urllib.parse.urlunparse((p.scheme, p.netloc, path, p.params, p.query, p.fragment))
+    """Robustly normalize a URL for deduplication and tool consistency."""
+    try:
+        p = urllib.parse.urlparse(url.strip())
+        scheme = p.scheme.lower() or "http"
+        netloc = p.netloc.lower()
+        path = p.path or "/"
+        # Ensure path starts with /
+        if not path.startswith("/"):
+            path = "/" + path
+        # Normalize: remove redundant /., etc. but keep trailing / if it was there
+        path = re.sub(r"/+", "/", path)
+        query = p.query
+        # Sort query params for stable normalization
+        if query:
+            qs = urllib.parse.parse_qsl(query, keep_blank_values=True)
+            qs.sort()
+            query = urllib.parse.urlencode(qs)
+        return urllib.parse.urlunparse((scheme, netloc, path, "", query, ""))
+    except Exception:
+        return url.strip()
+
+def _is_worth_scanning(url: str) -> bool:
+    """Return False if the URL points to a static asset that doesn't need vulnerability scanning."""
+    STATIC_EXTS = {
+        ".css", ".js", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg",
+        ".woff", ".woff2", ".ttf", ".eot", ".pdf", ".mp4", ".mp3",
+        ".wasm", ".map", ".json", ".xml", ".txt",
+    }
+    try:
+        path = urllib.parse.urlparse(url).path.lower()
+        ext = os.path.splitext(path)[1]
+        return ext not in STATIC_EXTS
+    except Exception:
+        return True
 
 def parse_netmalper(graph: dict):
     nodes = {n["id"]: n for n in graph.get("nodes", [])}
@@ -928,7 +958,7 @@ def ensure_wordlist(name: str, url: str) -> str:
 # ────────────────────────────────────────────────────────────────────────────
 #  PHASE 1 — FINGERPRINTING (always runs on every HTTP target)
 # ────────────────────────────────────────────────────────────────────────────
-def run_httpx(targets: list[WebTarget], plan: ToolPlan, timeout: int):
+def run_httpx(targets: list[WebTarget], plan: ToolPlan, timeout: int, stealth: StealthProfile):
     """Probe alive + fingerprint tech/server/status for every target."""
     if not targets:
         return []
@@ -936,15 +966,15 @@ def run_httpx(targets: list[WebTarget], plan: ToolPlan, timeout: int):
     args = ["-silent","-json","-l","-","-nc","-no-color","-timeout","10",
             "-tech-detect","-status-code","-title","-server","-follow-redirects"]
     # Stealth: random browser UA + extra (jittered) headers on every probe.
-    args += ["-H", f"User-Agent: {STEALTH.pick_ua()}"]
-    for h in STEALTH.default_headers():
+    args += ["-H", f"User-Agent: {stealth.pick_ua()}"]
+    for h in stealth.default_headers():
         args += ["-H", h]
     # Lower rate when polite/slow; httpx -rate-limit is per-second.
-    rl = STEALTH.polite_rl(150)
+    rl = stealth.polite_rl(150)
     args += ["-rate-limit", str(rl)]
     # Cap parallel fan-out so a 50-target graph doesn't burst-probe.
-    if STEALTH.polite or STEALTH.slow:
-        args += ["-threads", "10" if STEALTH.slow else "25"]
+    if stealth.polite or stealth.slow:
+        args += ["-threads", "10" if stealth.slow else "25"]
     by_url = {t.url: t for t in targets}
     findings: list[Finding] = []
 
@@ -989,10 +1019,10 @@ def run_httpx(targets: list[WebTarget], plan: ToolPlan, timeout: int):
             _parse_httpx_output(out)
     return findings
 
-def run_whatweb(t: WebTarget, plan: ToolPlan, timeout: int):
+def run_whatweb(t: WebTarget, plan: ToolPlan, timeout: int, stealth: StealthProfile):
     args = ["--color=never","--log-json=-","-a","1",
-            "--user-agent", STEALTH.pick_ua()]
-    for h in STEALTH.default_headers():
+            "--user-agent", stealth.pick_ua()]
+    for h in stealth.default_headers():
         args += ["--header", h]
     args.append(t.url)
     cmd = build_cmd(plan, args)
@@ -1023,11 +1053,11 @@ def run_whatweb(t: WebTarget, plan: ToolPlan, timeout: int):
                 ))
     return findings
 
-def run_wafw00f(t: WebTarget, plan: ToolPlan, timeout: int):
+def run_wafw00f(t: WebTarget, plan: ToolPlan, timeout: int, stealth: StealthProfile):
     host_dir = f"/tmp/vulnmalper_waf_{abs(hash(t.url))}"
     os.makedirs(host_dir, exist_ok=True)
     out_name = "waf.json"
-    ua = STEALTH.pick_ua()
+    ua = stealth.pick_ua()
     if plan.runner == "docker":
         container_dir = "/wrk"
         out_path = f"{container_dir}/{out_name}"
@@ -1200,7 +1230,7 @@ def _nikto_capabilities(plan: ToolPlan) -> dict:
     return caps
 
 
-def run_nikto(t: WebTarget, plan: ToolPlan, timeout: int):
+def run_nikto(t: WebTarget, plan: ToolPlan, timeout: int, stealth: StealthProfile):
     """Run nikto and parse its '+ ...' output lines.
 
     Built straight off the official option list at
@@ -1267,9 +1297,9 @@ def run_nikto(t: WebTarget, plan: ToolPlan, timeout: int):
     # -Format derived from extension on every build, so we omit it.
     # It's safer NOT to pass -Format than to pass an unsupported value.
     if caps["maxtime"]:
-        if STEALTH.slow:
+        if stealth.slow:
             maxtime = min(timeout, 570)
-        elif STEALTH.headless:
+        elif stealth.headless:
             maxtime = min(timeout, 1200)
         else:
             maxtime = min(timeout, 900)
@@ -1281,19 +1311,19 @@ def run_nikto(t: WebTarget, plan: ToolPlan, timeout: int):
         # 5/7(LFI/RFI), 6(DoS), 8(RCE) — wapiti/nuclei cover those better.
         args += ["-Tuning", "123bc"]
     if caps["useragent_flag"]:
-        args += ["-useragent", STEALTH.pick_ua()]
+        args += ["-useragent", stealth.pick_ua()]
     if caps["display"]:
         # V = verbose. Without it, some builds emit nothing on stdout.
         args += ["-Display", "V"]
-    if STEALTH.slow and caps["pause"]:
+    if stealth.slow and caps["pause"]:
         args += ["-Pause", "1"]
 
     # Custom headers — only on builds that actually support them.
     if caps["add_header"]:
-        for h in STEALTH.default_headers():
+        for h in stealth.default_headers():
             args += ["-Add-header", h]
     elif caps["request_header"]:
-        for h in STEALTH.default_headers():
+        for h in stealth.default_headers():
             args += ["-RequestHeader", h]
     # else: legacy 2.1.6 — silently skip. Better than a hard exit.
 
@@ -1397,15 +1427,15 @@ def run_nikto(t: WebTarget, plan: ToolPlan, timeout: int):
     shutil.rmtree(host_dir, ignore_errors=True)
     return findings
 
-def run_nuclei(t: WebTarget, plan: ToolPlan, severity: str, timeout: int):
+def run_nuclei(t: WebTarget, plan: ToolPlan, severity: str, timeout: int, stealth: StealthProfile):
     sev_chain = ["info","low","medium","high","critical"]
     keep = sev_chain[max(0, sev_chain.index(severity)):] if severity in sev_chain else sev_chain
-    rl = STEALTH.polite_rl(150)
+    rl = stealth.polite_rl(150)
     args = ["-u", t.url, "-jsonl","-silent","-nc",
             "-severity", ",".join(keep),
             "-exclude-tags", "fuzzing,dos,helpers",
             "-timeout","15","-retries","2","-rl",str(rl),
-            "-H", f"User-Agent: {STEALTH.pick_ua()}"]
+            "-H", f"User-Agent: {stealth.pick_ua()}"]
     if t.scheme != "https":
         args += ["-ept", "ssl,dns"]
     args += ["-retries", "2", "-mhe", "30"]
@@ -1414,7 +1444,7 @@ def run_nuclei(t: WebTarget, plan: ToolPlan, severity: str, timeout: int):
         args += ["-H", auth_hdr]
     if auth_cookie_value():
         args += ["-H", f"Cookie: {auth_cookie_value()}"]
-    for h in STEALTH.default_headers():
+    for h in stealth.default_headers():
         args += ["-H", h]
 
     # Handle template persistence for Docker
@@ -1428,18 +1458,18 @@ def run_nuclei(t: WebTarget, plan: ToolPlan, severity: str, timeout: int):
     # Default nuclei = 25 templates × 25 hosts in parallel = obvious burst.
     # We dial that down + spread requests across a wider window so the
     # per-second pattern doesn't scream "automated scanner".
-    if STEALTH.polite or STEALTH.slow or STEALTH.quiet:
+    if stealth.polite or stealth.slow or stealth.quiet:
         # -bs (bulk-size) = parallel hosts/template; -c = parallel templates.
         # Single-target scan, so bs=1 just removes one redundant axis.
         args += ["-bs", "1"]
-        args += ["-c", "5" if STEALTH.slow else "10"]
+        args += ["-c", "5" if stealth.slow else "10"]
         # Spread the rate over a longer window so bursts smooth out.
         # nuclei -rate-limit-duration accepts Go duration: "2s","5s",...
-        args += ["-rate-limit-duration", "5s" if STEALTH.slow else "2s"]
+        args += ["-rate-limit-duration", "5s" if stealth.slow else "2s"]
     # ── Quiet template set: exclude noisy/intrusive tags + redundant globs.
     # The curated tag list above is the primary filter; these are extra
     # reductions when the user explicitly asked for quieter probing.
-    if STEALTH.quiet or STEALTH.polite or STEALTH.slow:
+    if stealth.quiet or stealth.polite or stealth.slow:
         args += ["-etags", ",".join(NOISY_NUCLEI_TAGS)]
         for glob in NOISY_NUCLEI_TEMPLATE_GLOBS:
             args += ["-et", glob]
@@ -1447,7 +1477,7 @@ def run_nuclei(t: WebTarget, plan: ToolPlan, severity: str, timeout: int):
     # (e.g. Juice Shop's /rest/user/login is only discoverable after the
     # Angular bundle boots). Requires Chromium on the host (or in the
     # nuclei docker image, which already ships it).
-    if STEALTH.headless:
+    if stealth.headless:
         args += ["-headless", "-page-timeout", "20"]
         # nuclei refuses headless+host-network unless you also pass these:
         if plan.runner == "docker":
@@ -1504,7 +1534,7 @@ WAPITI_SEV_MAP = {1:"low",2:"medium",3:"high",4:"critical",0:"info",
                   "Low":"low","Medium":"medium","High":"high",
                   "Critical":"critical","Informational":"info"}
 
-def run_wapiti(t: WebTarget, plan: ToolPlan, timeout: int):
+def run_wapiti(t: WebTarget, plan: ToolPlan, timeout: int, stealth: StealthProfile):
     host_dir = f"/tmp/vulnmalper_wapiti_{abs(hash(t.url))}"
     os.makedirs(host_dir, exist_ok=True)
     report = "report.json"
@@ -1512,8 +1542,8 @@ def run_wapiti(t: WebTarget, plan: ToolPlan, timeout: int):
     base_url = f"{parsed_t.scheme}://{parsed_t.netloc}"
     scope = "page" if t.discovered else "folder"
 
-    extra = ["-A", STEALTH.pick_ua()]
-    for h in STEALTH.default_headers():
+    extra = ["-A", stealth.pick_ua()]
+    for h in stealth.default_headers():
         extra += ["-H", h]
 
     extra += [
@@ -1532,7 +1562,7 @@ def run_wapiti(t: WebTarget, plan: ToolPlan, timeout: int):
             continue
         extra += ["--start", seed]
 
-    if STEALTH.headless:
+    if stealth.headless:
         extra += ["--scope", "domain", "-d", "5"]
 
     extra += ["--module", "csrf,xss,sql,xxe,redirect,ssrf,timesql,blindsql,wapp,nikto,htaccess,cookieflags,csp,headers,http_headers"]
@@ -1734,13 +1764,13 @@ def _collect_json_urls(blob) -> list[str]:
         urls.append(blob)
     return urls
 
-def run_crawler(t: WebTarget, plan: Optional[ToolPlan], timeout: int) -> list[str]:
+def run_crawler(t: WebTarget, plan: Optional[ToolPlan], timeout: int, stealth: StealthProfile) -> list[str]:
     """Best-effort crawl with katana. Supports local or docker via ToolPlan."""
     if not plan:
         return []
     # katana equivalent: -u for url, -d for depth, -c for concurrency, -jc for JS crawl, -json for JSON, -nc for no-color
-    args = ["-u", t.url, "-d", "3", "-c", "10", "-jc", "-json", "-nc", "-H", f"User-Agent: {STEALTH.pick_ua()}"]
-    if STEALTH.headless:
+    args = ["-u", t.url, "-d", "3", "-c", "10", "-jc", "-json", "-nc", "-H", f"User-Agent: {stealth.pick_ua()}"]
+    if stealth.headless:
         args.append("-hl")
     cmd = build_cmd(plan, args)
     rc, out, err = _run(cmd, timeout)
@@ -1832,21 +1862,21 @@ def run_nmap_nse(asset: ServiceTarget, scripts: tuple[str, ...], timeout: int) -
                 ))
     return findings
 
-def run_service_nuclei(asset: ServiceTarget, plan: ToolPlan, timeout: int, severity: str) -> list[Finding]:
+def run_service_nuclei(asset: ServiceTarget, plan: ToolPlan, timeout: int, severity: str, stealth: StealthProfile) -> list[Finding]:
     tags = _service_scan_tags(asset)
     if not tags:
         return []
     sev_chain = ["info","low","medium","high","critical"]
     keep = sev_chain[max(0, sev_chain.index(severity)):] if severity in sev_chain else sev_chain
-    rl = STEALTH.polite_rl(50)
+    rl = stealth.polite_rl(50)
     url = _service_target_url(asset)
     args = ["-u", url, "-jsonl", "-silent", "-nc",
             "-tags", ",".join(tags),
             "-severity", ",".join(keep),
             "-exclude-tags", "fuzzing,dos,helpers",
             "-timeout", "10", "-rl", str(rl),
-            "-H", f"User-Agent: {STEALTH.pick_ua()}"]
-    for h in STEALTH.default_headers():
+            "-H", f"User-Agent: {stealth.pick_ua()}"]
+    for h in stealth.default_headers():
         args += ["-H", h]
     if auth_basic_header():
         args += ["-H", auth_basic_header()]
@@ -1880,7 +1910,7 @@ def run_service_nuclei(asset: ServiceTarget, plan: ToolPlan, timeout: int, sever
         ))
     return findings
 
-def run_phase0_service_scan(service_targets: list[ServiceTarget], plans: dict[str, Optional[ToolPlan]], timeout: int = 300, nuclei_timeout: Optional[int] = 300, severity: str = "low") -> list[Finding]:
+def run_phase0_service_scan(service_targets: list[ServiceTarget], plans: dict[str, Optional[ToolPlan]], stealth: StealthProfile, timeout: int = 300, nuclei_timeout: Optional[int] = 300, severity: str = "low") -> list[Finding]:
     findings: list[Finding] = []
     if not service_targets:
         return findings
@@ -1891,7 +1921,7 @@ def run_phase0_service_scan(service_targets: list[ServiceTarget], plans: dict[st
     for asset in service_plans:
         spec = SERVICE_SCAN_PLANS.get(asset.port, {})
         if spec.get("nuclei") and plans.get("nuclei"):
-            findings.extend(run_service_nuclei(asset, plans["nuclei"], nuclei_timeout, severity))
+            findings.extend(run_service_nuclei(asset, plans["nuclei"], nuclei_timeout, severity, stealth))
         if spec.get("nmap"):
             findings.extend(run_nmap_nse(asset, tuple(spec.get("nmap_scripts") or ()), timeout))
     return findings
@@ -2000,11 +2030,11 @@ SERVICE_CHAIN_PLAYBOOKS: dict[int, dict] = {
     },
 }
 
-def _http_probe(url: str, timeout: int = 10) -> tuple[int, str]:
+def _http_probe(url: str, stealth: StealthProfile, timeout: int = 10) -> tuple[int, str]:
     """Tiny stdlib HTTP GET — avoids pulling `requests` just for chaining.
     Returns (status_code, body_first_4kb). status=0 on connection failure."""
-    headers = {"User-Agent": STEALTH.pick_ua()}
-    for h in STEALTH.default_headers():
+    headers = {"User-Agent": stealth.pick_ua()}
+    for h in stealth.default_headers():
         if ":" in h:
             k, v = h.split(":", 1)
             headers[k.strip()] = v.strip()
@@ -2032,7 +2062,7 @@ def _tcp_probe(host: str, port: int, timeout: int = 4) -> bool:
     except Exception:
         return False
 
-def discover_forms(url: str) -> list[dict]:
+def discover_forms(url: str, stealth: StealthProfile) -> list[dict]:
     """Fetch a page and extract all forms with real field names and action URLs."""
 
     class FormParser(html.parser.HTMLParser):
@@ -2073,7 +2103,7 @@ def discover_forms(url: str) -> list[dict]:
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    req = urllib.request.Request(url, headers={"User-Agent": STEALTH.pick_ua()})
+    req = urllib.request.Request(url, headers={"User-Agent": stealth.pick_ua()})
     try:
         with urllib.request.urlopen(req, timeout=10, context=ctx) as r:
             body = r.read(50000).decode("utf-8", errors="replace")
@@ -2088,7 +2118,7 @@ def discover_forms(url: str) -> list[dict]:
     return parser.forms
 
 
-def build_sqlmap_targets(t: "WebTarget") -> list[tuple[str, str, str]]:
+def build_sqlmap_targets(t: "WebTarget", stealth: StealthProfile) -> list[tuple[str, str, str]]:
     """
     Returns list of (url, post_data, method).
     Discovers real form fields rather than guessing param names.
@@ -2096,7 +2126,7 @@ def build_sqlmap_targets(t: "WebTarget") -> list[tuple[str, str, str]]:
     targets: list[tuple[str, str, str]] = []
     seen: set[str] = set()
 
-    forms = discover_forms(t.url)
+    forms = discover_forms(t.url, stealth)
     for form in forms:
         action = form["action"].strip()
         if action.startswith("http"):
@@ -2143,7 +2173,7 @@ def build_sqlmap_targets(t: "WebTarget") -> list[tuple[str, str, str]]:
 
     return targets
 
-def confirm_target_liveness(t: WebTarget) -> bool:
+def confirm_target_liveness(t: WebTarget, stealth: StealthProfile) -> bool:
     """Double-check a target before considering it dead.
 
     Strategy:
@@ -2152,7 +2182,7 @@ def confirm_target_liveness(t: WebTarget) -> bool:
     """
     # Two HTTP attempts (covers transient resets/timeouts).
     for _ in range(2):
-        status, _ = _http_probe(t.url, timeout=8)
+        status, _ = _http_probe(t.url, stealth, timeout=8)
         if status > 0:
             t.alive = True
             if t.status is None:
@@ -2215,12 +2245,12 @@ WAF_CDN_TECH_TOKENS = {
     "incapsula", "cloudfront", "azure cdn", "aws elb", "stackpath",
 }
 
-def _probe_response_headers(url: str, timeout: int = 6) -> dict:
+def _probe_response_headers(url: str, stealth: StealthProfile, timeout: int = 6) -> dict:
     """Single GET, return the response headers as a lowercased dict.
     Uses the active stealth headers so we look like a normal browser to
     the WAF too — otherwise a curl-shaped probe might itself flag us."""
-    headers = {"User-Agent": STEALTH.pick_ua()}
-    for h in STEALTH.default_headers():
+    headers = {"User-Agent": stealth.pick_ua()}
+    for h in stealth.default_headers():
         if ":" in h:
             k, v = h.split(":", 1)
             headers[k.strip()] = v.strip()
@@ -2270,7 +2300,11 @@ def _is_private_host(host: str) -> bool:
             return True
     return False
 
-def detect_strategy(t: WebTarget) -> tuple[str, str]:
+# Host-level WAF detection cache to avoid redundant probes on the same host.
+WAF_CACHE: dict[str, Optional[str]] = {}
+WAF_CACHE_LOCK = threading.Lock()
+
+def detect_strategy(t: WebTarget, stealth: StealthProfile) -> tuple[str, str]:
     """Inspect a finished-Phase-1 target and pick its strategy.
     Returns (strategy_name, human_readable_reason).
 
@@ -2281,20 +2315,42 @@ def detect_strategy(t: WebTarget) -> tuple[str, str]:
     """
     # ── 1. WAF/CDN — strongest signal, wins over everything ───────────
     if t.waf:
+        with WAF_CACHE_LOCK:
+            WAF_CACHE[t.host] = t.waf
         return "stealth", f"WAF detected by wafw00f ({t.waf})"
+    
+    # Check host-level cache first
+    with WAF_CACHE_LOCK:
+        if t.host in WAF_CACHE and WAF_CACHE[t.host]:
+            t.waf = WAF_CACHE[t.host]
+            return "stealth", f"WAF detected previously on this host ({t.waf})"
+
     tech_blob = " ".join((x or "").lower() for x in (t.tech or []))
     for tok in WAF_CDN_TECH_TOKENS:
         if tok in tech_blob:
+            with WAF_CACHE_LOCK:
+                WAF_CACHE[t.host] = tok
             return "stealth", f"CDN/WAF tech fingerprint ({tok})"
+
     # Cheap header sniff — single GET, ignored on failure.
-    hdrs = _probe_response_headers(t.url)
+    hdrs = _probe_response_headers(t.url, stealth)
     for h, vendor in WAF_CDN_HEADERS.items():
         if h in hdrs:
+            with WAF_CACHE_LOCK:
+                WAF_CACHE[t.host] = vendor
             return "stealth", f"edge header `{h}` → {vendor}"
     server = (hdrs.get("server") or "").lower()
     for tok, vendor in WAF_CDN_SERVER_TOKENS.items():
         if tok in server:
+            with WAF_CACHE_LOCK:
+                WAF_CACHE[t.host] = vendor
             return "stealth", f"Server: {vendor}"
+    
+    # Cache "no WAF" for this host to skip future probes
+    with WAF_CACHE_LOCK:
+        if t.host not in WAF_CACHE:
+            WAF_CACHE[t.host] = None
+
     # ── 2. Private / internal IP → aggressive ─────────────────────────
     if _is_private_host(t.host):
         return "aggressive", f"private/internal host ({t.host})"
@@ -2365,16 +2421,16 @@ def _format_auto_banner(t: WebTarget, strategy: str, reason: str,
     return (f"{C.MG}[auto]{C.R} {t.url} → {label}  "
             f"({C.GY}{reason}{C.R})  ·  " + " · ".join(knobs))
 
-def _ensure_auto_strategy(t: WebTarget) -> tuple[str, str]:
+def _ensure_auto_strategy(t: WebTarget, stealth: StealthProfile) -> tuple[str, str]:
     """Resolve and cache auto strategy/reason once per target."""
     if t.auto_strategy and t.auto_reason:
         return t.auto_strategy, t.auto_reason
-    strategy, reason = detect_strategy(t)
+    strategy, reason = detect_strategy(t, stealth)
     t.auto_strategy = strategy
     t.auto_reason = reason
     return strategy, reason
 
-def run_service_chain(t: WebTarget, timeout: int = 15) -> list[Finding]:
+def run_service_chain(t: WebTarget, stealth: StealthProfile, timeout: int = 15) -> list[Finding]:
     """If t looks like a known service (by port + tech fingerprint), run its
     targeted probe playbook. This is *active reasoning*: the scanner says
     "that's Prometheus on 9090, let me hit /api/v1/status/config" instead of
@@ -2399,7 +2455,7 @@ def run_service_chain(t: WebTarget, timeout: int = 15) -> list[Finding]:
 
     for path, sev, title in play["probes"]:
         url = base + path
-        status, body = _http_probe(url, timeout=timeout)
+        status, body = _http_probe(url, stealth, timeout=timeout)
         if status == 0:
             continue
         if 200 <= status < 300:
@@ -2416,13 +2472,13 @@ def run_service_chain(t: WebTarget, timeout: int = 15) -> list[Finding]:
 
 # ── PHASE 3 — VERIFY (sqlmap, only on endpoints upstream flagged)
 # ────────────────────────────────────────────────────────────────────────────
-def run_sqlmap(url: str, plan: ToolPlan, timeout: int,
+def run_sqlmap(url: str, plan: ToolPlan, timeout: int, stealth: StealthProfile,
                post_data: str = "", cookie: str = "",
                waf_detected: bool = False):
     host_dir = f"/tmp/vulnmalper_sqlmap_{abs(hash(url))}"
     os.makedirs(host_dir, exist_ok=True)
-    ua = STEALTH.pick_ua()
-    stealth_sqlmap = STEALTH.polite or STEALTH.slow or STEALTH.quiet
+    ua = stealth.pick_ua()
+    stealth_sqlmap = stealth.polite or stealth.slow or stealth.quiet
 
     level = SQLMAP_LEVEL if SQLMAP_LEVEL is not None else (1 if stealth_sqlmap else 4)
     risk  = SQLMAP_RISK  if SQLMAP_RISK  is not None else (1 if stealth_sqlmap else 2)
@@ -2441,7 +2497,7 @@ def run_sqlmap(url: str, plan: ToolPlan, timeout: int,
     if cookie_val:
         extra += ["--cookie", cookie_val]
 
-    hdrs = STEALTH.default_headers()
+    hdrs = stealth.default_headers()
     if hdrs:
         extra += ["--headers", "\n".join(hdrs)]
 
@@ -2456,8 +2512,8 @@ def run_sqlmap(url: str, plan: ToolPlan, timeout: int,
     extra += ["--technique", "BEUSTQ"]
 
     # Delays
-    if STEALTH.polite or STEALTH.slow:
-        d = max(1, int(STEALTH.polite_delay(500) / 1000))
+    if stealth.polite or stealth.slow:
+        d = max(1, int(stealth.polite_delay(500) / 1000))
         extra += ["--delay", str(d), "--safe-freq", "5"]
     else:
         extra += ["--delay", "0", "--safe-freq", "3"]
@@ -3069,12 +3125,6 @@ def main():
                     "Phase 1 (WAF/CDN→stealth, private IP→aggressive, "
                     "else→balanced). Pass any --polite/--quiet/--rate-limit/"
                     "etc. to disable.")
-        # Per-target STEALTH swaps mutate the module global; serialise scan
-        # workers so two threads can't trample each other's profile.
-        if args.threads > 1:
-            log("warn", f"[auto] forcing --threads 1 (was {args.threads}) so "
-                        "per-target stealth swaps stay coherent")
-            args.threads = 1
 
     in_path = Path(args.input)
     if not in_path.exists():
@@ -3175,6 +3225,7 @@ def main():
         service_findings = run_phase0_service_scan(
             service_targets,
             plans,
+            STEALTH,
             timeout=300,
             nuclei_timeout=timeouts["nuclei"],
             severity=args.severity,
@@ -3186,7 +3237,7 @@ def main():
 
     if plans["httpx"]:
         log("run", f"httpx ({plans['httpx'].runner}) on {len(targets)} target(s)")
-        fs = run_httpx(targets, plans["httpx"], timeouts["httpx"])
+        fs = run_httpx(targets, plans["httpx"], timeouts["httpx"], STEALTH)
         log("ok", f"  httpx → {len(fs)} findings")
         all_findings.extend(fs)
     else:
@@ -3196,9 +3247,9 @@ def main():
     def _fp_worker(t: WebTarget):
         out: list[Finding] = []
         if plans["whatweb"]:
-            out.extend(run_whatweb(t, plans["whatweb"], timeouts["whatweb"]))
+            out.extend(run_whatweb(t, plans["whatweb"], timeouts["whatweb"], STEALTH))
         if plans["wafw00f"]:
-            out.extend(run_wafw00f(t, plans["wafw00f"], timeouts["wafw00f"]))
+            out.extend(run_wafw00f(t, plans["wafw00f"], timeouts["wafw00f"], STEALTH))
         return out
 
     if plans["whatweb"] or plans["wafw00f"]:
@@ -3214,7 +3265,7 @@ def main():
         revived = 0
         log("info", f"Rechecking {len(dead_candidates)} target(s) that looked dead...")
         for t in dead_candidates:
-            if confirm_target_liveness(t):
+            if confirm_target_liveness(t, STEALTH):
                 revived += 1
                 all_findings.append(Finding(
                     target=t.url, tool="liveness-check", severity="info",
@@ -3269,11 +3320,11 @@ def main():
 
         def _crawl_worker(t: WebTarget):
             if auto_mode:
-                strategy, reason = _ensure_auto_strategy(t)
+                strategy, reason = _ensure_auto_strategy(t, STEALTH)
                 if strategy == "stealth":
                     log("skip", f"crawl → {t.url} skipped in auto stealth mode ({reason})")
                     return []
-            urls = run_crawler(t, plans.get("katana"), min(timeouts.get("katana", 600), 600))
+            urls = run_crawler(t, plans.get("katana"), min(timeouts.get("katana", 600), 600), STEALTH)
             if not urls:
                 return []
             log("run", f"katana crawl → {t.url} ({len(urls)} raw url(s))")
@@ -3288,7 +3339,7 @@ def main():
             targets.extend(discovered_targets)
             if plans["httpx"]:
                 log("run", f"httpx fingerprinting {len(discovered_targets)} crawled target(s)")
-                fs = run_httpx(discovered_targets, plans["httpx"], timeouts["httpx"])
+                fs = run_httpx(discovered_targets, plans["httpx"], timeouts["httpx"], STEALTH)
                 all_findings.extend(fs)
             with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as ex:
                 for fs in ex.map(_fp_worker, discovered_targets):
@@ -3305,10 +3356,15 @@ def main():
             if auto_mode:
                 # Auto mode picks strategy per target. If this target is
                 # classified as stealth, skip aggressive discovery fuzzers.
-                strategy, reason = _ensure_auto_strategy(t)
+                strategy, reason = _ensure_auto_strategy(t, STEALTH)
                 if strategy == "stealth":
                     log("skip", f"discovery → {t.url} skipped in auto stealth mode ({reason})")
                     return [], []
+            
+            # Skip non-scannable assets
+            if not _is_worth_scanning(t.url):
+                return [], []
+
             # Trigger logic: Status 200/403 OR Tech match
             tech_match = any(dt in " ".join(t.tech).lower() for dt in DISCOVERY_TECHS)
             status_match = t.status in (200, 403)
@@ -3321,7 +3377,7 @@ def main():
                 fs, urls = run_feroxbuster(t, plans["feroxbuster"], timeouts["feroxbuster"])
                 local_findings.extend(fs)
                 for u in urls:
-                    # Normalize URL to remove trailing slashes
+                    # Normalize URL
                     normalized_url = _normalize_url(u)
                     p = urllib.parse.urlparse(normalized_url)
                     new_targets.append(WebTarget(
@@ -3334,7 +3390,7 @@ def main():
                 fs, urls = run_ffuf(t, plans["ffuf"], timeouts["ffuf"])
                 local_findings.extend(fs)
                 for u in urls:
-                    # Normalize URL to remove trailing slashes
+                    # Normalize URL
                     normalized_url = _normalize_url(u)
                     p = urllib.parse.urlparse(normalized_url)
                     new_targets.append(WebTarget(
@@ -3365,13 +3421,10 @@ def main():
             if new_list:
                 log("ok", f"Discovered {len(new_list)} new targets! Adding to full stack scan pool.")
                 targets.extend(new_list)
-                # For newly discovered targets, we might want to run Phase 1 (httpx/whatweb) on them too?
-                # The user said "the full stack shud also scan whatewver ffuf or feroxbuster found".
-                # Nikto/Nuclei/Wapiti are in Phase 2. So they will be scanned.
-                # But they might need tech info. Let's run a quick fingerprint on them.
+                # For newly discovered targets, run a quick fingerprint.
                 if plans["httpx"]:
                     log("run", f"httpx fingerprinting {len(new_list)} new target(s)")
-                    fs = run_httpx(new_list, plans["httpx"], timeouts["httpx"])
+                    fs = run_httpx(new_list, plans["httpx"], timeouts["httpx"], STEALTH)
                     all_findings.extend(fs)
                 
                 # whatweb/wafw00f for new targets
@@ -3387,21 +3440,23 @@ def main():
     base_stealth = STEALTH
 
     def _scan_worker(t: WebTarget):
-        global STEALTH
         out: list[Finding] = []
         if not t.alive:
             log("skip", f"{t.url} — dead/unreachable, skipping scan")
             return out
-        # ── Auto-mode: pick a strategy for THIS target and swap STEALTH
-        # for the duration of its tool runs. Restored in `finally` so a
-        # tool exception can't leak the wrong profile into the next target.
-        swapped = False
+        
+        # ── Auto-mode: pick a strategy for THIS target
+        local_stealth = base_stealth
         if auto_mode:
-            strategy, reason = _ensure_auto_strategy(t)
-            new_prof = build_auto_profile(strategy, base_stealth)
-            log("info", _format_auto_banner(t, strategy, reason, new_prof))
-            STEALTH = new_prof
-            swapped = True
+            strategy, reason = _ensure_auto_strategy(t, base_stealth)
+            local_stealth = build_auto_profile(strategy, base_stealth)
+            log("info", _format_auto_banner(t, strategy, reason, local_stealth))
+        
+        # Centralized static file filtering
+        if not _is_worth_scanning(t.url):
+            log("skip", f"{t.url} — static asset, skipping deep scan")
+            return out
+
         try:
             # ── High-value scanners first ──────────────────────────────
             # nuclei + wapiti always run before nikto/testssl so their
@@ -3409,20 +3464,13 @@ def main():
 
             # nuclei on all HTTP targets (run first — most valuable)
             if plans["nuclei"]:
-                SKIP_NUCLEI_EXT = {".css", ".js", ".png", ".jpg", ".jpeg",
-                                   ".gif", ".ico", ".svg", ".woff", ".woff2",
-                                   ".ttf", ".eot", ".txt", ".xml", ".pdf"}
-                _ext = os.path.splitext(urllib.parse.urlparse(t.url).path)[1].lower()
-                if _ext in SKIP_NUCLEI_EXT:
-                    log("skip", f"nuclei → {t.url} (static file)")
-                else:
-                    log("run", f"nuclei ({plans['nuclei'].runner}) → {t.url}")
-                    tt = time.time()
-                    fs = run_nuclei(t, plans["nuclei"], args.severity, timeouts["nuclei"])
-                    log("ok" if fs else "skip",
-                        f"  nuclei {round(time.time()-tt,1)}s — {len(fs)} findings")
-                    out.extend(fs)
-                    STEALTH.sleep_jitter()  # avoid burst pattern between tools
+                log("run", f"nuclei ({plans['nuclei'].runner}) → {t.url}")
+                tt = time.time()
+                fs = run_nuclei(t, plans["nuclei"], args.severity, timeouts["nuclei"], local_stealth)
+                log("ok" if fs else "skip",
+                    f"  nuclei {round(time.time()-tt,1)}s — {len(fs)} findings")
+                out.extend(fs)
+                local_stealth.sleep_jitter()  # avoid burst pattern between tools
 
             # ── Slower / lower-priority scanners ──────────────────────
 
@@ -3434,7 +3482,7 @@ def main():
                 log("ok" if fs else "skip",
                     f"  testssl {round(time.time()-tt,1)}s — {len(fs)} findings")
                 out.extend(fs)
-                STEALTH.sleep_jitter()
+                local_stealth.sleep_jitter()
             # nikto — only on original NetMalper targets (root/port),
             # NEVER on endpoints discovered by crawlers/fuzzers.
             # nikto's 600s timeout per discovered URL would starve
@@ -3443,7 +3491,7 @@ def main():
                 if not t.discovered:
                     log("run", f"nikto ({plans['nikto'].runner}) → {t.url}")
                     tt = time.time()
-                    fs = run_nikto(t, plans["nikto"], timeouts["nikto"])
+                    fs = run_nikto(t, plans["nikto"], timeouts["nikto"], local_stealth)
                     log("ok" if fs else "skip",
                         f"  nikto {round(time.time()-tt,1)}s — {len(fs)} findings")
                     out.extend(fs)
@@ -3455,15 +3503,15 @@ def main():
             if plans["wapiti"]:
                 log("run", f"wapiti ({plans['wapiti'].runner}) → {t.url}")
                 tt = time.time()
-                fs = run_wapiti(t, plans["wapiti"], timeouts["wapiti"])
+                fs = run_wapiti(t, plans["wapiti"], timeouts["wapiti"], local_stealth)
                 log("ok" if fs else "skip",
                     f"  wapiti {round(time.time()-tt,1)}s — {len(fs)} findings")
                 out.extend(fs)
-                STEALTH.sleep_jitter()
+                local_stealth.sleep_jitter()
             return out
-        finally:
-            if swapped:
-                STEALTH = base_stealth
+        except Exception as e:
+            log("err", f"Scan worker failed for {t.url}: {e}")
+            return out
 
     if args.threads <= 1:
         for t in targets: all_findings.extend(_scan_worker(t))
@@ -3480,7 +3528,7 @@ def main():
     if auto_mode:
         filtered: list[WebTarget] = []
         for t in chainable:
-            strategy, reason = _ensure_auto_strategy(t)
+            strategy, reason = _ensure_auto_strategy(t, base_stealth)
             if strategy == "stealth":
                 log("skip", f"chain → {t.url} skipped in auto stealth mode ({reason})")
                 continue
@@ -3491,54 +3539,56 @@ def main():
                "Grafana, Docker API, …)")
         log("info", f"{len(chainable)} target(s) match a known service playbook")
         for t in chainable:
+            # Re-resolve strategy to get correct profile for _http_probe
+            local_stealth = base_stealth
+            if auto_mode:
+                strategy, reason = _ensure_auto_strategy(t, base_stealth)
+                local_stealth = build_auto_profile(strategy, base_stealth)
             log("run", f"chain → {t.url}  (port {t.port})")
-            all_findings.extend(run_service_chain(t))
+            all_findings.extend(run_service_chain(t, local_stealth))
 
     # ── PHASE 3: sqlmap verification on curated endpoints ──────────────────
     _phase("Phase 3 — Verifying SQLi candidates (sqlmap)")
 
-    sqli_queue: list[tuple[str, str]] = []  # (url, post_data)
+    sqli_queue: list[tuple[str, str, StealthProfile]] = []  # (url, post_data, stealth)
     seen_sqli: set[str] = set()
 
     for t in targets:
+        local_stealth = base_stealth
         if auto_mode:
-            strategy, reason = _ensure_auto_strategy(t)
+            strategy, reason = _ensure_auto_strategy(t, base_stealth)
             if strategy == "stealth":
                 if t.injectable or t.alive:
                     log("skip", f"sqlmap on {t.url} skipped — auto stealth ({reason})")
                 continue
+            local_stealth = build_auto_profile(strategy, base_stealth)
 
-        # Skip static files
-        _ext = os.path.splitext(urllib.parse.urlparse(t.url).path)[1].lower()
-        if _ext in {".css", ".js", ".png", ".jpg", ".gif", ".ico",
-                    ".txt", ".xml", ".svg", ".woff", ".ttf"}:
+        # Skip non-scannable assets
+        if not _is_worth_scanning(t.url):
             continue
 
-        for url, post_data, method in build_sqlmap_targets(t):
+        for url, post_data, method in build_sqlmap_targets(t, local_stealth):
             key = f"{url}|{post_data}"
             if key not in seen_sqli:
                 seen_sqli.add(key)
-                sqli_queue.append((url, post_data))
+                sqli_queue.append((url, post_data, local_stealth))
 
     if not plans["sqlmap"]:
         log("skip", "sqlmap unavailable — skipping phase 3")
     elif not sqli_queue:
         log("skip", "No injectable endpoints found by form discovery or upstream tools")
     else:
-        log("info", f"{len(sqli_queue)} endpoint(s) queued for sqlmap:")
-        for u, pd in sqli_queue:
-            method_label = "POST" if pd else "GET"
-            log("info", f"  [{method_label}] {u}" + (f" data={pd[:60]}" if pd else ""))
+        log("info", f"{len(sqli_queue)} endpoint(s) queued for sqlmap")
 
-        def _sqli_worker(item: tuple[str, str]):
-            url, post_data = item
+        def _sqli_worker(item: tuple[str, str, StealthProfile]):
+            url, post_data, stealth = item
             # pass waf_detected so tamper selection is smart
             waf = any(t.waf for t in targets
                       if t.url.startswith(f"{urllib.parse.urlparse(url).scheme}://"
                                           f"{urllib.parse.urlparse(url).netloc}"))
             log("run", f"sqlmap ({plans['sqlmap'].runner}) → {url}")
             tt = time.time()
-            fs = run_sqlmap(url, plans["sqlmap"], timeouts["sqlmap"],
+            fs = run_sqlmap(url, plans["sqlmap"], timeouts["sqlmap"], stealth,
                             post_data=post_data, waf_detected=bool(waf))
             log("ok" if fs else "skip",
                 f"  sqlmap {round(time.time()-tt,1)}s — {len(fs)} findings")
