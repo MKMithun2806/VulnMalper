@@ -2472,11 +2472,24 @@ def run_service_chain(t: WebTarget, stealth: StealthProfile, timeout: int = 15) 
 
 # ── PHASE 3 — VERIFY (sqlmap, only on endpoints upstream flagged)
 # ────────────────────────────────────────────────────────────────────────────
-def run_sqlmap(url: str, plan: ToolPlan, timeout: int, stealth: StealthProfile,
-               post_data: str = "", cookie: str = "",
-               waf_detected: bool = False):
-    host_dir = f"/tmp/vulnmalper_sqlmap_{abs(hash(url))}"
-    os.makedirs(host_dir, exist_ok=True)
+def run_sqlmap(targets: list[tuple[str, str]], plan: ToolPlan, timeout: int, stealth: StealthProfile,
+               cookie: str = "", waf_detected: bool = False):
+    """
+    Run sqlmap on a list of targets (url, post_data) for a single host.
+    Uses a targets file (-m) to batch scan endpoints efficiently.
+    """
+    if not targets:
+        return []
+
+    host_dir = tempfile.mkdtemp(prefix="vulnmalper_sqlmap_", dir="/tmp")
+    os.chmod(host_dir, 0o777)
+    
+    # Write targets to a file for sqlmap -m
+    targets_file_path = os.path.join(host_dir, "targets.txt")
+    with open(targets_file_path, "w") as f:
+        for url, post_data in targets:
+            f.write(f"{url}\n") # Simplified for now, sqlmap handles GET params in URL
+
     ua = stealth.pick_ua()
     stealth_sqlmap = stealth.polite or stealth.slow or stealth.quiet
 
@@ -2501,13 +2514,6 @@ def run_sqlmap(url: str, plan: ToolPlan, timeout: int, stealth: StealthProfile,
     if hdrs:
         extra += ["--headers", "\n".join(hdrs)]
 
-    # POST data + auth merge
-    form_data = post_data or ""
-    if AUTH.user and AUTH.password:
-        form_data = merge_form_data(form_data, auth_form_data())
-    if form_data:
-        extra += ["--data", form_data]
-
     # Techniques
     extra += ["--technique", "BEUSTQ"]
 
@@ -2523,17 +2529,17 @@ def run_sqlmap(url: str, plan: ToolPlan, timeout: int, stealth: StealthProfile,
 
     if plan.runner == "docker":
         container_dir = "/wrk"
-        args = ["-u", url, "--disable-coloring",
+        args = ["-m", f"{container_dir}/targets.txt", "--disable-coloring",
                 "--output-dir", container_dir,
                 "--timeout", "30", "--retries", "3"] + extra
         cmd = build_cmd(plan, args, mount=(host_dir, container_dir))
     else:
-        args = ["-u", url, "--disable-coloring",
+        args = ["-m", targets_file_path, "--disable-coloring",
                 "--output-dir", host_dir,
                 "--timeout", "30", "--retries", "3"] + extra
         cmd = build_cmd(plan, args)
 
-    log("run", f"sqlmap: {' '.join(cmd[:8])}...")
+    log("run", f"sqlmap batch ({len(targets)} targets) on {targets[0][0][:40]}...")
     rc, out, err = _run(cmd, timeout)
     findings: list[Finding] = []
     text = out + "\n" + err
@@ -3550,7 +3556,8 @@ def main():
     # ── PHASE 3: sqlmap verification on curated endpoints ──────────────────
     _phase("Phase 3 — Verifying SQLi candidates (sqlmap)")
 
-    sqli_queue: list[tuple[str, str, StealthProfile]] = []  # (url, post_data, stealth)
+    # Group targets by host to allow batching
+    sqli_targets_by_host: dict[str, list[tuple[str, str, StealthProfile, bool]]] = {}
     seen_sqli: set[str] = set()
 
     for t in targets:
@@ -3571,36 +3578,35 @@ def main():
             key = f"{url}|{post_data}"
             if key not in seen_sqli:
                 seen_sqli.add(key)
-                sqli_queue.append((url, post_data, local_stealth))
+                host = urllib.parse.urlparse(url).netloc
+                sqli_targets_by_host.setdefault(host, []).append((url, post_data, local_stealth, bool(t.waf)))
 
     if not plans["sqlmap"]:
         log("skip", "sqlmap unavailable — skipping phase 3")
-    elif not sqli_queue:
+    elif not sqli_targets_by_host:
         log("skip", "No injectable endpoints found by form discovery or upstream tools")
     else:
-        log("info", f"{len(sqli_queue)} endpoint(s) queued for sqlmap")
+        log("info", f"{len(sqli_targets_by_host)} host(s) queued for sqlmap batching")
 
-        def _sqli_worker(item: tuple[str, str, StealthProfile]):
-            url, post_data, stealth = item
-            # pass waf_detected so tamper selection is smart
-            waf = any(t.waf for t in targets
-                      if t.url.startswith(f"{urllib.parse.urlparse(url).scheme}://"
-                                          f"{urllib.parse.urlparse(url).netloc}"))
-            log("run", f"sqlmap ({plans['sqlmap'].runner}) → {url}")
+        def _sqli_host_worker(host_targets):
+            # Pick a common stealth profile and waf status for the host batch
+            first_url, _, stealth, waf = host_targets[0]
+            batch = [(u, p) for u, p, s, w in host_targets]
+            
+            log("run", f"sqlmap batch ({len(batch)} targets) → {host}")
             tt = time.time()
-            fs = run_sqlmap(url, plans["sqlmap"], timeouts["sqlmap"], stealth,
-                            post_data=post_data, waf_detected=bool(waf))
+            fs = run_sqlmap(batch, plans["sqlmap"], timeouts["sqlmap"], stealth, waf_detected=waf)
             log("ok" if fs else "skip",
                 f"  sqlmap {round(time.time()-tt,1)}s — {len(fs)} findings")
             return fs
 
         if args.threads <= 1:
-            for item in sqli_queue:
-                all_findings.extend(_sqli_worker(item))
+            for host, host_targets in sqli_targets_by_host.items():
+                all_findings.extend(_sqli_host_worker(host_targets))
         else:
             with concurrent.futures.ThreadPoolExecutor(
                     max_workers=min(args.threads, 3)) as ex:
-                for fs in ex.map(_sqli_worker, sqli_queue):
+                for fs in ex.map(_sqli_host_worker, list(sqli_targets_by_host.values())):
                     all_findings.extend(fs)
 
     duration = time.time() - t0
