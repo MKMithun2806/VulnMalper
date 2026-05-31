@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VulnMalper v7.2.8  —  Vulnerability pipeline for NetMalper graphs.
+VulnMalper v7.3.0  —  Vulnerability pipeline for NetMalper graphs.
 
 Pipeline:
     NetMalper JSON
@@ -54,7 +54,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-VERSION = "7.2.8"
+VERSION = "7.3.0"
 
 # Background warmup state for docker images and nuclei templates.
 DOCKER_IMAGE_EVENTS: dict[str, threading.Event] = {}
