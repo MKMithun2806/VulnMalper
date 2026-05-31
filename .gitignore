@@ -4,3 +4,9 @@ dist/
 __pycache__/
 build/
 context.md
+
+# Nuitka
+vulnmalper.build/
+vulnmalper.dist/
+vulnmalper.onefile-build/
+vulnmalper
