@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VulnMalper v7.3.0  —  Vulnerability pipeline for NetMalper graphs.
+VulnMalper v7.3.1  —  Vulnerability pipeline for NetMalper graphs.
 
 Pipeline:
     NetMalper JSON
@@ -54,7 +54,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-VERSION = "7.3.0"
+VERSION = "7.3.1"
 
 # Background warmup state for docker images and nuclei templates.
 DOCKER_IMAGE_EVENTS: dict[str, threading.Event] = {}
@@ -1466,7 +1466,7 @@ def run_nuclei(targets: list[str], plan: ToolPlan, severity: str, timeout: Optio
     # Handle template persistence for Docker
     nuclei_mounts = []
     if plan.runner == "docker":
-        template_dir = _nuclei_template_dir()
+        template_dir = _nuclei_template_host_dir()
         if not _ensure_nuclei_templates_ready(plan, targets[0]):
             return []
         nuclei_mounts.append((template_dir, "/root/nuclei-templates"))
@@ -3052,6 +3052,7 @@ def main():
     ap.add_argument("--ffuf-timeout",     type=int, default=600)
     ap.add_argument("--feroxbuster-timeout", type=int, default=900)
     ap.add_argument("--katana-timeout", type=int, default=600)
+    ap.add_argument("--nmap-timeout",   type=int, default=300)
     ap.add_argument("--sqlmap-level", type=int, default=None,
                     help="Override sqlmap --level (default: 3 normal, 1 stealth)")
     ap.add_argument("--sqlmap-risk", type=int, default=None,
@@ -3108,7 +3109,7 @@ def main():
              "`--no-timeout=7200` (all tools, 2h) or "
              "`--no-timeout nuclei,nikto=10800` (those two, 3h). "
              "Valid tool names: httpx, whatweb, wafw00f, testssl, nikto, "
-             "nuclei, wapiti, sqlmap, ffuf, feroxbuster, katana.")
+             "nuclei, wapiti, sqlmap, ffuf, feroxbuster, katana, nmap.")
 
     ap.add_argument("--addtimeout", action="store_true",
         help="Enable process-level timeout for nuclei (uses --nuclei-timeout, default 86400s). "
@@ -3222,7 +3223,7 @@ def main():
         "nikto": args.nikto_timeout, "nuclei": args.nuclei_timeout if args.addtimeout else None,
         "wapiti": args.wapiti_timeout, "sqlmap": args.sqlmap_timeout,
         "ffuf": args.ffuf_timeout, "feroxbuster": args.feroxbuster_timeout,
-        "katana": args.katana_timeout,
+        "katana": args.katana_timeout, "nmap": args.nmap_timeout,
     }
 
     # Disable aggressive fuzzers if ANY stealth/polite flags are set
@@ -3271,7 +3272,7 @@ def main():
             service_targets,
             plans,
             STEALTH,
-            timeout=300,
+            timeout=timeouts["nmap"],
             nuclei_timeout=timeouts["nuclei"],
             severity=args.severity,
         )
