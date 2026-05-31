@@ -651,7 +651,7 @@ def warm_nuclei_templates(plan: Optional[ToolPlan]):
                     os.makedirs(template_dir, exist_ok=True)
 
                 log("info", "Refreshing Nuclei templates in background...")
-                cmd = build_cmd(plan, ["-update-templates"], mount=(template_dir, "/root/nuclei-templates"))
+                cmd = build_cmd(plan, ["-update-templates", "-silent"], mount=(template_dir, "/root/nuclei-templates"))
                 rc, out, err = _run(cmd, 300)
                 if rc != 0:
                     log("warn", f"Nuclei template refresh failed (rc={rc}), retrying...")
@@ -1404,7 +1404,6 @@ def run_nuclei(t: WebTarget, plan: ToolPlan, severity: str, timeout: int):
     args = ["-u", t.url, "-jsonl","-silent","-nc",
             "-severity", ",".join(keep),
             "-exclude-tags", "fuzzing,dos,helpers",
-            "-stats",
             "-timeout","15","-retries","2","-rl",str(rl),
             "-H", f"User-Agent: {STEALTH.pick_ua()}"]
     if t.scheme != "https":
@@ -1453,13 +1452,6 @@ def run_nuclei(t: WebTarget, plan: ToolPlan, severity: str, timeout: int):
         # nuclei refuses headless+host-network unless you also pass these:
         if plan.runner == "docker":
             args += ["-system-chrome"]
-
-    # Debug: log nuclei configuration visibility as requested
-    log("info", f"[*] nuclei profile:")
-    log("info", f"    tags=none (all templates)")
-    log("info", f"    severity={','.join(keep)}")
-    log("info", f"    timeout=15")
-    log("info", f"    rl={rl}")
 
     cmd = build_cmd(plan, args, mount=nuclei_mount)
     rc, out, err = _run(cmd, timeout)
@@ -1852,7 +1844,6 @@ def run_service_nuclei(asset: ServiceTarget, plan: ToolPlan, timeout: int, sever
             "-tags", ",".join(tags),
             "-severity", ",".join(keep),
             "-exclude-tags", "fuzzing,dos,helpers",
-            "-stats",
             "-timeout", "10", "-rl", str(rl),
             "-H", f"User-Agent: {STEALTH.pick_ua()}"]
     for h in STEALTH.default_headers():
