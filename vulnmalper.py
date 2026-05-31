@@ -681,7 +681,7 @@ def warm_nuclei_templates(plan: Optional[ToolPlan]):
                     os.makedirs(template_dir, exist_ok=True)
 
                 log("info", "Refreshing Nuclei templates in background...")
-                cmd = build_cmd(plan, ["-update-templates", "-silent"], mount=(template_dir, "/root/nuclei-templates"))
+                cmd = build_cmd(plan, ["-update-templates", "-silent"], mounts=[(template_dir, "/root/nuclei-templates")])
                 rc, out, err = _run(cmd, 300)
                 if rc != 0:
                     log("warn", f"Nuclei template refresh failed (rc={rc}), retrying...")
@@ -923,7 +923,7 @@ def _looks_like_advisory_path(path: str) -> bool:
         return False
 
 def build_cmd(plan: ToolPlan, tool_args: list[str],
-              mount: Optional[tuple[str,str]] = None,
+              mounts: Optional[list[tuple[str,str]]] = None,
               extra_docker: Optional[list[str]] = None,
               local_binary: Optional[str] = None) -> list[str]:
     """Build the final subprocess command for either runner."""
@@ -931,10 +931,10 @@ def build_cmd(plan: ToolPlan, tool_args: list[str],
         return [local_binary or LOCAL_BINARIES[plan.name]] + tool_args
     wait_for_docker_image(plan)
     docker = ["docker","run","--rm","-i","--network","host"]
-    if mount:
-        host, container = mount
-        os.makedirs(host, exist_ok=True)
-        docker += ["-v", f"{host}:{container}"]
+    if mounts:
+        for host, container in mounts:
+            os.makedirs(host, exist_ok=True)
+            docker += ["-v", f"{host}:{container}"]
     if extra_docker:
         docker += extra_docker
     docker += [plan.image]
@@ -1062,7 +1062,7 @@ def run_wafw00f(t: WebTarget, plan: ToolPlan, timeout: int, stealth: StealthProf
         container_dir = "/wrk"
         out_path = f"{container_dir}/{out_name}"
         args = ["-U", ua, t.url, "-a", "-o", out_path, "-f", "json"]
-        cmd = build_cmd(plan, args, mount=(host_dir, container_dir))
+        cmd = build_cmd(plan, args, mounts=[(host_dir, container_dir)])
     else:
         out_path = os.path.join(host_dir, out_name)
         args = ["-U", ua, t.url, "-a", "-o", out_path, "-f", "json"]
@@ -1113,7 +1113,7 @@ def run_testssl(t: WebTarget, plan: ToolPlan, timeout: int):
         container_dir = "/wrk"
         args = ["--quiet","--color","0","--jsonfile",
                 f"{container_dir}/{out_name}", target]
-        cmd = build_cmd(plan, args, mount=(host_dir, container_dir))
+        cmd = build_cmd(plan, args, mounts=[(host_dir, container_dir)])
     else:
         args = ["--quiet","--color","0","--jsonfile",
                 os.path.join(host_dir, out_name), target]
@@ -1328,7 +1328,7 @@ def run_nikto(t: WebTarget, plan: ToolPlan, timeout: int, stealth: StealthProfil
     # else: legacy 2.1.6 — silently skip. Better than a hard exit.
 
     if plan.runner == "docker":
-        cmd = build_cmd(plan, args, mount=(host_dir, container_dir))
+        cmd = build_cmd(plan, args, mounts=[(host_dir, container_dir)])
     else:
         cmd = build_cmd(plan, args)
 
@@ -1427,87 +1427,80 @@ def run_nikto(t: WebTarget, plan: ToolPlan, timeout: int, stealth: StealthProfil
     shutil.rmtree(host_dir, ignore_errors=True)
     return findings
 
-def run_nuclei(t: WebTarget, plan: ToolPlan, severity: str, timeout: int, stealth: StealthProfile):
+def run_nuclei(targets: list[str], plan: ToolPlan, severity: str, timeout: Optional[int], stealth: StealthProfile, auth: AuthProfile):
+    """
+    Run nuclei on a list of URLs for a single host.
+    """
+    if not targets:
+        return []
+
     sev_chain = ["info","low","medium","high","critical"]
     keep = sev_chain[max(0, sev_chain.index(severity)):] if severity in sev_chain else sev_chain
     rl = stealth.polite_rl(150)
-    args = ["-u", t.url, "-jsonl","-silent","-nc",
+    
+    host_dir = tempfile.mkdtemp(prefix="vulnmalper_nuclei_", dir="/tmp")
+    os.chmod(host_dir, 0o777)
+    targets_file = os.path.join(host_dir, "targets.txt")
+    with open(targets_file, "w") as f:
+        for u in targets: f.write(f"{u}\n")
+
+    args = ["-l", targets_file if plan.runner != "docker" else "/wrk/targets.txt", 
+            "-jsonl","-silent","-nc",
             "-severity", ",".join(keep),
             "-exclude-tags", "fuzzing,dos,helpers",
             "-timeout","15","-retries","2","-rl",str(rl),
             "-H", f"User-Agent: {stealth.pick_ua()}"]
-    if t.scheme != "https":
+    
+    if any(u.startswith("http://") for u in targets):
         args += ["-ept", "ssl,dns"]
     args += ["-retries", "2", "-mhe", "30"]
-    auth_hdr = auth_basic_header()
-    if auth_hdr:
-        args += ["-H", auth_hdr]
-    if auth_cookie_value():
-        args += ["-H", f"Cookie: {auth_cookie_value()}"]
+    
+    cookie_val = auth.cookie or auth_cookie_value()
+    if cookie_val: args += ["-H", f"Cookie: {cookie_val}"]
+    if auth.user and auth.password:
+        args += ["--auth-credential", f"{auth.user}%{auth.password}", "--auth-method", "post"]
+
     for h in stealth.default_headers():
         args += ["-H", h]
 
     # Handle template persistence for Docker
-    nuclei_mount = None
+    nuclei_mounts = []
     if plan.runner == "docker":
-        nuclei_mount = _nuclei_template_mount()
-        if not _ensure_nuclei_templates_ready(plan, t.url):
+        template_dir = _nuclei_template_dir()
+        if not _ensure_nuclei_templates_ready(plan, targets[0]):
             return []
+        nuclei_mounts.append((template_dir, "/root/nuclei-templates"))
+        nuclei_mounts.append((host_dir, "/wrk"))
 
-    # ── Stealth: smaller, smarter probing under --polite / --slow / --quiet
-    # Default nuclei = 25 templates × 25 hosts in parallel = obvious burst.
-    # We dial that down + spread requests across a wider window so the
-    # per-second pattern doesn't scream "automated scanner".
+    # Stealth options
     if stealth.polite or stealth.slow or stealth.quiet:
-        # -bs (bulk-size) = parallel hosts/template; -c = parallel templates.
-        # Single-target scan, so bs=1 just removes one redundant axis.
-        args += ["-bs", "1"]
-        args += ["-c", "5" if stealth.slow else "10"]
-        # Spread the rate over a longer window so bursts smooth out.
-        # nuclei -rate-limit-duration accepts Go duration: "2s","5s",...
-        args += ["-rate-limit-duration", "5s" if stealth.slow else "2s"]
-    # ── Quiet template set: exclude noisy/intrusive tags + redundant globs.
-    # The curated tag list above is the primary filter; these are extra
-    # reductions when the user explicitly asked for quieter probing.
+        args += ["-bs", "1", "-c", "5" if stealth.slow else "10", 
+                 "-rate-limit-duration", "5s" if stealth.slow else "2s"]
     if stealth.quiet or stealth.polite or stealth.slow:
         args += ["-etags", ",".join(NOISY_NUCLEI_TAGS)]
-        for glob in NOISY_NUCLEI_TEMPLATE_GLOBS:
-            args += ["-et", glob]
-    # Headless: render JS so nuclei can hit SPA-only endpoints
-    # (e.g. Juice Shop's /rest/user/login is only discoverable after the
-    # Angular bundle boots). Requires Chromium on the host (or in the
-    # nuclei docker image, which already ships it).
+        for glob in NOISY_NUCLEI_TEMPLATE_GLOBS: args += ["-et", glob]
     if stealth.headless:
         args += ["-headless", "-page-timeout", "20"]
-        # nuclei refuses headless+host-network unless you also pass these:
-        if plan.runner == "docker":
-            args += ["-system-chrome"]
+        if plan.runner == "docker": args += ["-system-chrome"]
 
-    cmd = build_cmd(plan, args, mount=nuclei_mount)
+    cmd = build_cmd(plan, args, mounts=nuclei_mounts)
+
+    log("run", f"nuclei batch ({len(targets)} targets) → {targets[0][:40]}...")
     rc, out, err = _run(cmd, timeout)
     findings: list[Finding] = []
     INJ_TAGS = {"sqli","sql-injection","injection","xss","ssti","lfi","rfi"}
     
-    # ── Output logic fix ───────────────────────────────────────────────
-    # Distinguish between 0 findings (rc=0, empty out) and failure (rc!=0)
     if rc == 0:
         if out:
-            lines = out.strip().splitlines()
-            json_lines = [l for l in lines if l.startswith("{")]
-            log("info", f"nuclei: got {len(json_lines)} JSON results from {t.url}")
+            lines = [l for l in out.strip().splitlines() if l.startswith("{")]
+            log("info", f"nuclei: got {len(lines)} JSON results")
         else:
-            log("info", f"nuclei completed successfully (0 findings) for {t.url}")
-            # nuclei emits progress snapshots as JSON objects on stderr.
-            # Summarize them so the CLI stays readable and no raw JSON leaks.
+            log("info", "nuclei completed successfully (0 findings)")
             if err:
                 stats = _summarize_nuclei_stats(err)
-                if stats:
-                    log("info", f"    {stats}")
+                if stats: log("info", f"    {stats}")
     else:
-        log("warn", f"nuclei failed rc={rc} for {t.url}")
-        if err:
-            snippet = _first_human_line(err) or _first_human_line(out) or "no human-readable output"
-            log("warn", f"nuclei stderr: {snippet[:240]}")
+        log("warn", f"nuclei failed rc={rc}")
 
     for line in out.splitlines():
         line = line.strip()
@@ -1516,8 +1509,7 @@ def run_nuclei(t: WebTarget, plan: ToolPlan, severity: str, timeout: int, stealt
         except Exception: continue
         info = j.get("info", {})
         sev  = (info.get("severity") or "unknown").lower()
-        tags_found = set(info.get("tags") or [])
-        matched = j.get("matched-at") or t.url
+        matched = j.get("matched-at") or targets[0]
         findings.append(Finding(
             target=matched, tool="nuclei", severity=sev,
             title=info.get("name") or j.get("template-id") or "nuclei finding",
@@ -1525,9 +1517,7 @@ def run_nuclei(t: WebTarget, plan: ToolPlan, severity: str, timeout: int, stealt
             reference=", ".join(info.get("reference") or []),
             raw=j,
         ))
-        # Feed sqlmap when nuclei points at an injection-flavored URL w/ params.
-        if (tags_found & INJ_TAGS) and "?" in matched and matched not in t.injectable:
-            t.injectable.append(matched)
+    shutil.rmtree(host_dir, ignore_errors=True)
     return findings
 
 WAPITI_SEV_MAP = {1:"low",2:"medium",3:"high",4:"critical",0:"info",
@@ -1577,7 +1567,7 @@ def run_wapiti(t: WebTarget, plan: ToolPlan, timeout: int, stealth: StealthProfi
         args = ["-u", t.url, "-f","json","-o", f"{container_dir}/{report}",
                 "--flush-session","--level","2",
                 "--max-scan-time", str(min(timeout, 1200)), "-S","paranoid"] + extra
-        cmd = build_cmd(plan, args, mount=(host_dir, container_dir))
+        cmd = build_cmd(plan, args, mounts=[(host_dir, container_dir)])
     else:
         args = ["-u", t.url, "-f","json","-o", os.path.join(host_dir, report),
                 "--flush-session","--level","2",
@@ -1887,7 +1877,7 @@ def run_service_nuclei(asset: ServiceTarget, plan: ToolPlan, timeout: int, sever
         nuclei_mount = _nuclei_template_mount()
         if not _ensure_nuclei_templates_ready(plan, f"{asset.host}:{asset.port}"):
             return []
-    cmd = build_cmd(plan, args, mount=nuclei_mount)
+    cmd = build_cmd(plan, args, mounts=[nuclei_mount] if nuclei_mount else None)
     rc, out, err = _run(cmd, timeout)
     findings: list[Finding] = []
     for line in out.splitlines():
@@ -2530,7 +2520,7 @@ def run_sqlmap(url: str, plan: ToolPlan, timeout: int, stealth: StealthProfile, 
     if plan.runner == "docker":
         container_dir = "/wrk"
         args = ["-u", url, "--disable-coloring", "--output-dir", container_dir, "--timeout", "30"] + extra
-        cmd = build_cmd(plan, args, mount=(host_dir, container_dir))
+        cmd = build_cmd(plan, args, mounts=[(host_dir, container_dir)])
     else:
         args = ["-u", url, "--disable-coloring", "--output-dir", host_dir, "--timeout", "30"] + extra
         cmd = build_cmd(plan, args)
@@ -2573,7 +2563,7 @@ def run_sqlmap_batch(urls: list[str], plan: ToolPlan, timeout: int, stealth: Ste
     if plan.runner == "docker":
         container_dir = "/wrk"
         args = ["-m", f"{container_dir}/targets.txt", "--disable-coloring", "--output-dir", container_dir] + extra
-        cmd = build_cmd(plan, args, mount=(host_dir, container_dir))
+        cmd = build_cmd(plan, args, mounts=[(host_dir, container_dir)])
     else:
         args = ["-m", targets_file, "--disable-coloring", "--output-dir", host_dir] + extra
         cmd = build_cmd(plan, args)
@@ -3494,85 +3484,73 @@ def main():
     # swaps can always restore it cleanly between targets.
     base_stealth = STEALTH
 
-    def _scan_worker(t: WebTarget):
+    # Group targets by netloc for nuclei batching
+    targets_by_host: dict[str, list[WebTarget]] = {}
+    for t in targets:
+        if not t.alive: continue
+        host = urllib.parse.urlparse(t.url).netloc
+        targets_by_host.setdefault(host, []).append(t)
+
+    def _scan_host_worker(host_targets: list[WebTarget]):
+        if not host_targets: return []
         out: list[Finding] = []
-        if not t.alive:
-            log("skip", f"{t.url} — dead/unreachable, skipping scan")
-            return out
         
-        # ── Auto-mode: pick a strategy for THIS target
+        # Pick a lead target for auto-strategy (or use base)
+        lead = host_targets[0]
         local_stealth = base_stealth
         if auto_mode:
-            strategy, reason = _ensure_auto_strategy(t, base_stealth)
+            strategy, reason = _ensure_auto_strategy(lead, base_stealth)
             local_stealth = build_auto_profile(strategy, base_stealth)
-            log("info", _format_auto_banner(t, strategy, reason, local_stealth))
+            log("info", _format_auto_banner(lead, strategy, reason, local_stealth))
         
-        # Centralized static file filtering
-        if not _is_worth_scanning(t.url):
-            log("skip", f"{t.url} — static asset, skipping deep scan")
-            return out
-
-        try:
-            # ── High-value scanners first ──────────────────────────────
-            # nuclei + wapiti always run before nikto/testssl so their
-            # results are never starved by nikto's 600s timeout.
-
-            # nuclei on all HTTP targets (run first — most valuable)
-            if plans["nuclei"]:
-                log("run", f"nuclei ({plans['nuclei'].runner}) → {t.url}")
-                tt = time.time()
-                fs = run_nuclei(t, plans["nuclei"], args.severity, timeouts["nuclei"], local_stealth)
-                log("ok" if fs else "skip",
-                    f"  nuclei {round(time.time()-tt,1)}s — {len(fs)} findings")
+        # ── 1. Batch Nuclei
+        if plans["nuclei"]:
+            scannable = [t.url for t in host_targets if _is_worth_scanning(t.url)]
+            if scannable:
+                fs = run_nuclei(scannable, plans["nuclei"], args.severity, timeouts["nuclei"], local_stealth, AUTH)
                 out.extend(fs)
-                local_stealth.sleep_jitter()  # avoid burst pattern between tools
+                # Feed back injectable endpoints to WebTarget objects
+                for f in fs:
+                    if "?" in f.target:
+                        for t in host_targets:
+                            if t.url == f.target:
+                                if f.target not in t.injectable: t.injectable.append(f.target)
+                local_stealth.sleep_jitter()
 
-            # ── Slower / lower-priority scanners ──────────────────────
-
-            # testssl only for HTTPS (TLS) ports - check both port AND scheme
+        # ── 2. Other tools (still per-target for now as they don't batch well)
+        for t in host_targets:
+            # testssl
             if plans["testssl"] and t.scheme == "https" and t.port in TLS_PORTS:
                 log("run", f"testssl ({plans['testssl'].runner}) → {t.url}")
                 tt = time.time()
                 fs = run_testssl(t, plans["testssl"], timeouts["testssl"])
-                log("ok" if fs else "skip",
-                    f"  testssl {round(time.time()-tt,1)}s — {len(fs)} findings")
+                log("ok" if fs else "skip", f"  testssl {round(time.time()-tt,1)}s — {len(fs)} findings")
                 out.extend(fs)
                 local_stealth.sleep_jitter()
-            # nikto — only on original NetMalper targets (root/port),
-            # NEVER on endpoints discovered by crawlers/fuzzers.
-            # nikto's 600s timeout per discovered URL would starve
-            # nuclei and wapiti out of execution time.
-            if plans["nikto"] and t.scheme in ("http", "https") and t.port in NIKTO_PORTS:
-                if not t.discovered:
-                    log("run", f"nikto ({plans['nikto'].runner}) → {t.url}")
-                    tt = time.time()
-                    fs = run_nikto(t, plans["nikto"], timeouts["nikto"], local_stealth)
-                    log("ok" if fs else "skip",
-                        f"  nikto {round(time.time()-tt,1)}s — {len(fs)} findings")
-                    out.extend(fs)
-                else:
-                    log("skip", f"nikto → {t.url} (discovered endpoint, skipping)")
-
-            # wapiti — active app scanner, all HTTP targets
-            # Run after nikto so it can use nikto's discovered endpoints as seeds.
+            
+            # nikto
+            if plans["nikto"] and t.scheme in ("http", "https") and t.port in NIKTO_PORTS and not t.discovered:
+                log("run", f"nikto ({plans['nikto'].runner}) → {t.url}")
+                tt = time.time()
+                fs = run_nikto(t, plans["nikto"], timeouts["nikto"], local_stealth)
+                log("ok" if fs else "skip", f"  nikto {round(time.time()-tt,1)}s — {len(fs)} findings")
+                out.extend(fs)
+            
+            # wapiti
             if plans["wapiti"]:
                 log("run", f"wapiti ({plans['wapiti'].runner}) → {t.url}")
                 tt = time.time()
                 fs = run_wapiti(t, plans["wapiti"], timeouts["wapiti"], local_stealth)
-                log("ok" if fs else "skip",
-                    f"  wapiti {round(time.time()-tt,1)}s — {len(fs)} findings")
+                log("ok" if fs else "skip", f"  wapiti {round(time.time()-tt,1)}s — {len(fs)} findings")
                 out.extend(fs)
                 local_stealth.sleep_jitter()
-            return out
-        except Exception as e:
-            log("err", f"Scan worker failed for {t.url}: {e}")
-            return out
+        return out
 
     if args.threads <= 1:
-        for t in targets: all_findings.extend(_scan_worker(t))
+        for host_targets in targets_by_host.values(): all_findings.extend(_scan_host_worker(host_targets))
     else:
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as ex:
-            for fs in ex.map(_scan_worker, targets):
+            for fs in ex.map(_scan_host_worker, list(targets_by_host.values())):
                 all_findings.extend(fs)
 
     # ── PHASE 2.5: active service chaining ────────────────────────────────
