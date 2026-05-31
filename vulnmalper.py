@@ -2542,29 +2542,48 @@ def run_sqlmap(targets: list[tuple[str, str]], plan: ToolPlan, timeout: int, ste
     log("run", f"sqlmap batch ({len(targets)} targets) on {targets[0][0][:40]}...")
     rc, out, err = _run(cmd, timeout)
     findings: list[Finding] = []
+    
+    # ── Extraction Strategy 1: Regex on console output (fastest) ──────────
     text = out + "\n" + err
-
     blocks = re.findall(
         r"Parameter:\s*(.+?)\n\s*Type:\s*(.+?)\n\s*Title:\s*(.+?)\n\s*Payload:\s*(.+?)(?:\n\s*\n|\Z)",
         text, re.S,
     )
     for param, typ, title, payload in blocks:
         findings.append(Finding(
-            target=url, tool="sqlmap", severity="critical",
+            target=targets[0][0], # Batch target
+            tool="sqlmap", severity="critical",
             title=f"SQL Injection ({typ.strip()}) on `{param.strip()}`",
             detail=f"Title: {title.strip()}\nPayload: {payload.strip()}",
             reference="https://owasp.org/www-community/attacks/SQL_Injection",
         ))
 
-    target_host = urllib.parse.urlparse(url).hostname or "target"
-    log_file = os.path.join(host_dir, target_host, "log")
-    if os.path.exists(log_file) and os.path.getsize(log_file) > 0 and not findings:
-        findings.append(Finding(
-            target=url, tool="sqlmap", severity="critical",
-            title="SQL Injection Detected (verified via log)",
-            detail="sqlmap confirmed injectable. Check tool logs for payloads.",
-            reference="https://owasp.org/www-community/attacks/SQL_Injection",
-        ))
+    # ── Extraction Strategy 2: Walk the output dir for session logs ───────
+    # sqlmap creates subdirectories per hostname.
+    for root, dirs, files in os.walk(host_dir):
+        if "log" in files:
+            log_path = os.path.join(root, "log")
+            if os.path.getsize(log_path) > 0:
+                # If we didn't get results from regex, or we want to double check
+                with open(log_path, "r") as f:
+                    log_content = f.read()
+                
+                # Check for DBMS fingerprint
+                dbms_match = re.search(r"back-end DBMS: (.+)", log_content)
+                dbms_info = f" (DBMS: {dbms_match.group(1).strip()})" if dbms_match else ""
+                
+                if not findings:
+                    findings.append(Finding(
+                        target=targets[0][0], tool="sqlmap", severity="critical",
+                        title=f"SQL Injection Detected{dbms_info}",
+                        detail="sqlmap confirmed injectable. Check logs for details.",
+                        reference="https://owasp.org/www-community/attacks/SQL_Injection",
+                    ))
+                elif dbms_info:
+                    # Append DBMS info to existing findings
+                    for f in findings:
+                        if "DBMS:" not in f.title:
+                            f.title += dbms_info
 
     shutil.rmtree(host_dir, ignore_errors=True)
     return findings
