@@ -2472,64 +2472,39 @@ def run_service_chain(t: WebTarget, stealth: StealthProfile, timeout: int = 15) 
 
 # ── PHASE 3 — VERIFY (sqlmap, only on endpoints upstream flagged)
 # ────────────────────────────────────────────────────────────────────────────
-def run_sqlmap(targets: list[tuple[str, str]], plan: ToolPlan, timeout: int, stealth: StealthProfile,
-               cookie: str = "", waf_detected: bool = False):
+def run_sqlmap(url: str, plan: ToolPlan, timeout: int, stealth: StealthProfile, auth: AuthProfile,
+               post_data: str = "", waf_detected: bool = False):
     """
-    Run sqlmap on a list of targets (url, post_data) for a single host.
-    Uses a targets file (-m) to batch scan endpoints efficiently.
+    Run sqlmap on a single target.
     """
-    if not targets:
-        return []
-
     host_dir = tempfile.mkdtemp(prefix="vulnmalper_sqlmap_", dir="/tmp")
     os.chmod(host_dir, 0o777)
-    
-    # Write targets to a file for sqlmap -m
-    targets_file_path = os.path.join(host_dir, "targets.txt")
-    with open(targets_file_path, "w") as f:
-        for url, post_data in targets:
-            f.write(f"{url}\n") # Simplified for now, sqlmap handles GET params in URL
-
     ua = stealth.pick_ua()
-    stealth_sqlmap = stealth.polite or stealth.slow or stealth.quiet
-
+    
     # ── Auto-tuning: level/risk based on strategy ────────────────────────
-    # Defaults: Level 4, Risk 2 (Balanced)
-    # Aggressive: Level 5, Risk 3
-    # Stealth/Polite: Level 1, Risk 1
     if SQLMAP_LEVEL is not None:
         level = SQLMAP_LEVEL
     else:
         if stealth.slow or stealth.polite: level = 1
-        elif not stealth.jitter:           level = 5 # "Aggressive" hint
+        elif not stealth.jitter:           level = 5
         else:                              level = 4
 
     if SQLMAP_RISK is not None:
         risk = SQLMAP_RISK
     else:
         if stealth.slow or stealth.polite: risk = 1
-        elif not stealth.jitter:           risk = 3 # "Aggressive" hint
+        elif not stealth.jitter:           risk = 3
         else:                              risk = 2
 
-    extra = ["--level", str(level), "--risk", str(risk)]
-    
-    # Random-agent as a fallback, though we pass --user-agent explicitly too
-    extra += ["--random-agent"]
+    extra = ["--level", str(level), "--risk", str(risk), "--random-agent"]
 
-    # Tamper scripts: minimal on clean targets, evasion-focused on WAF targets
     if waf_detected:
-        # More comprehensive tamper set for WAF evasion
-        tamper_scripts = [
-            "between", "charencode", "space2comment", "randomcase",
-            "apostrophemask", "base64encode", "multiplespaces", "unionalltounion"
-        ]
-        extra += ["--hex", "--no-cast"] # Further WAF evasion
+        extra += ["--tamper", "between,charencode,space2comment,randomcase,apostrophemask,base64encode,multiplespaces,unionalltounion",
+                  "--hex", "--no-cast"]
     else:
-        tamper_scripts = ["between", "space2comment"]
-    extra += ["--tamper", ",".join(tamper_scripts)]
+        extra += ["--tamper", "between,space2comment"]
 
-    # Headers
-    cookie_val = cookie or auth_cookie_value()
+    cookie_val = auth.cookie or auth_cookie_value() # Fallback to global helper for now
     if cookie_val:
         extra += ["--cookie", cookie_val]
 
@@ -2537,36 +2512,78 @@ def run_sqlmap(targets: list[tuple[str, str]], plan: ToolPlan, timeout: int, ste
     if hdrs:
         extra += ["--headers", "\n".join(hdrs)]
 
-    # Techniques
-    extra += ["--technique", "BEUSTQ"]
+    # POST data + auth merge
+    form_data = post_data or ""
+    if auth.user and auth.password:
+        form_data = merge_form_data(form_data, auth_form_data()) # Still uses global helper
+    if form_data:
+        extra += ["--data", form_data]
 
-    # Delays
+    extra += ["--technique", "BEUSTQ", "--batch", "--non-interactive"]
+
     if stealth.polite or stealth.slow:
         d = max(1, int(stealth.polite_delay(500) / 1000))
         extra += ["--delay", str(d), "--safe-freq", "5"]
     else:
         extra += ["--delay", "0", "--safe-freq", "3"]
 
-    # No prompts
-    extra += ["--batch", "--non-interactive"]
+    if plan.runner == "docker":
+        container_dir = "/wrk"
+        args = ["-u", url, "--disable-coloring", "--output-dir", container_dir, "--timeout", "30"] + extra
+        cmd = build_cmd(plan, args, mount=(host_dir, container_dir))
+    else:
+        args = ["-u", url, "--disable-coloring", "--output-dir", host_dir, "--timeout", "30"] + extra
+        cmd = build_cmd(plan, args)
+
+    log("run", f"sqlmap → {url[:60]}...")
+    rc, out, err = _run(cmd, timeout)
+    return _parse_sqlmap_results(host_dir, out, err, [url])
+
+def run_sqlmap_batch(urls: list[str], plan: ToolPlan, timeout: int, stealth: StealthProfile, auth: AuthProfile,
+                     waf_detected: bool = False):
+    """
+    Run sqlmap on a list of GET URLs for a single host.
+    """
+    if not urls: return []
+    host_dir = tempfile.mkdtemp(prefix="vulnmalper_sqlmap_batch_", dir="/tmp")
+    os.chmod(host_dir, 0o777)
+    
+    targets_file = os.path.join(host_dir, "targets.txt")
+    with open(targets_file, "w") as f:
+        for u in urls: f.write(f"{u}\n")
+
+    ua = stealth.pick_ua()
+    
+    # Auto-tuning (re-used logic)
+    level = SQLMAP_LEVEL if SQLMAP_LEVEL is not None else (1 if (stealth.slow or stealth.polite) else 5 if not stealth.jitter else 4)
+    risk  = SQLMAP_RISK  if SQLMAP_RISK  is not None else (1 if (stealth.slow or stealth.polite) else 3 if not stealth.jitter else 2)
+
+    extra = ["--level", str(level), "--risk", str(risk), "--random-agent", "--batch", "--non-interactive"]
+    if waf_detected:
+        extra += ["--tamper", "between,charencode,space2comment,randomcase,apostrophemask,base64encode,multiplespaces,unionalltounion",
+                  "--hex", "--no-cast"]
+    else:
+        extra += ["--tamper", "between,space2comment"]
+
+    cookie_val = auth.cookie or auth_cookie_value()
+    if cookie_val: extra += ["--cookie", cookie_val]
+    hdrs = stealth.default_headers()
+    if hdrs: extra += ["--headers", "\n".join(hdrs)]
 
     if plan.runner == "docker":
         container_dir = "/wrk"
-        args = ["-m", f"{container_dir}/targets.txt", "--disable-coloring",
-                "--output-dir", container_dir,
-                "--timeout", "30", "--retries", "3"] + extra
+        args = ["-m", f"{container_dir}/targets.txt", "--disable-coloring", "--output-dir", container_dir] + extra
         cmd = build_cmd(plan, args, mount=(host_dir, container_dir))
     else:
-        args = ["-m", targets_file_path, "--disable-coloring",
-                "--output-dir", host_dir,
-                "--timeout", "30", "--retries", "3"] + extra
+        args = ["-m", targets_file, "--disable-coloring", "--output-dir", host_dir] + extra
         cmd = build_cmd(plan, args)
 
-    log("run", f"sqlmap batch ({len(targets)} targets) on {targets[0][0][:40]}...")
+    log("run", f"sqlmap batch ({len(urls)} urls) → {urls[0][:40]}...")
     rc, out, err = _run(cmd, timeout)
+    return _parse_sqlmap_results(host_dir, out, err, urls)
+
+def _parse_sqlmap_results(host_dir: str, out: str, err: str, targets: list[str]) -> list[Finding]:
     findings: list[Finding] = []
-    
-    # ── Extraction Strategy 1: Regex on console output (fastest) ──────────
     text = out + "\n" + err
     blocks = re.findall(
         r"Parameter:\s*(.+?)\n\s*Type:\s*(.+?)\n\s*Title:\s*(.+?)\n\s*Payload:\s*(.+?)(?:\n\s*\n|\Z)",
@@ -2574,40 +2591,30 @@ def run_sqlmap(targets: list[tuple[str, str]], plan: ToolPlan, timeout: int, ste
     )
     for param, typ, title, payload in blocks:
         findings.append(Finding(
-            target=targets[0][0], # Batch target
+            target=targets[0], 
             tool="sqlmap", severity="critical",
             title=f"SQL Injection ({typ.strip()}) on `{param.strip()}`",
             detail=f"Title: {title.strip()}\nPayload: {payload.strip()}",
             reference="https://owasp.org/www-community/attacks/SQL_Injection",
         ))
 
-    # ── Extraction Strategy 2: Walk the output dir for session logs ───────
-    # sqlmap creates subdirectories per hostname.
     for root, dirs, files in os.walk(host_dir):
         if "log" in files:
             log_path = os.path.join(root, "log")
             if os.path.getsize(log_path) > 0:
-                # If we didn't get results from regex, or we want to double check
-                with open(log_path, "r") as f:
-                    log_content = f.read()
-                
-                # Check for DBMS fingerprint
+                with open(log_path, "r") as f: log_content = f.read()
                 dbms_match = re.search(r"back-end DBMS: (.+)", log_content)
                 dbms_info = f" (DBMS: {dbms_match.group(1).strip()})" if dbms_match else ""
-                
                 if not findings:
                     findings.append(Finding(
-                        target=targets[0][0], tool="sqlmap", severity="critical",
+                        target=targets[0], tool="sqlmap", severity="critical",
                         title=f"SQL Injection Detected{dbms_info}",
                         detail="sqlmap confirmed injectable. Check logs for details.",
                         reference="https://owasp.org/www-community/attacks/SQL_Injection",
                     ))
                 elif dbms_info:
-                    # Append DBMS info to existing findings
                     for f in findings:
-                        if "DBMS:" not in f.title:
-                            f.title += dbms_info
-
+                        if "DBMS:" not in f.title: f.title += dbms_info
     shutil.rmtree(host_dir, ignore_errors=True)
     return findings
 
@@ -3598,8 +3605,9 @@ def main():
     # ── PHASE 3: sqlmap verification on curated endpoints ──────────────────
     _phase("Phase 3 — Verifying SQLi candidates (sqlmap)")
 
-    # Group targets by host to allow batching
-    sqli_targets_by_host: dict[str, list[tuple[str, str, StealthProfile, bool]]] = {}
+    # Group GET targets by host for batching; POST targets run individually.
+    sqli_get_by_host: dict[str, list[tuple[str, StealthProfile, bool]]] = {}
+    sqli_post_queue: list[tuple[str, str, StealthProfile, bool]] = []
     seen_sqli: set[str] = set()
 
     for t in targets:
@@ -3620,35 +3628,41 @@ def main():
             key = f"{url}|{post_data}"
             if key not in seen_sqli:
                 seen_sqli.add(key)
-                host = urllib.parse.urlparse(url).netloc
-                sqli_targets_by_host.setdefault(host, []).append((url, post_data, local_stealth, bool(t.waf)))
+                if post_data:
+                    sqli_post_queue.append((url, post_data, local_stealth, bool(t.waf)))
+                else:
+                    host = urllib.parse.urlparse(url).netloc
+                    sqli_get_by_host.setdefault(host, []).append((url, local_stealth, bool(t.waf)))
 
     if not plans["sqlmap"]:
         log("skip", "sqlmap unavailable — skipping phase 3")
-    elif not sqli_targets_by_host:
+    elif not sqli_get_by_host and not sqli_post_queue:
         log("skip", "No injectable endpoints found by form discovery or upstream tools")
     else:
-        log("info", f"{len(sqli_targets_by_host)} host(s) queued for sqlmap batching")
+        # ── 1. Batch GET targets
+        def _sqli_get_worker(host_targets):
+            urls = [u for u, s, w in host_targets]
+            # Use stealth/waf from first target in batch
+            _, stealth, waf = host_targets[0]
+            return run_sqlmap_batch(urls, plans["sqlmap"], timeouts["sqlmap"], stealth, AUTH, waf_detected=waf)
 
-        def _sqli_host_worker(host_targets):
-            # Pick a common stealth profile and waf status for the host batch
-            first_url, _, stealth, waf = host_targets[0]
-            batch = [(u, p) for u, p, s, w in host_targets]
-            
-            log("run", f"sqlmap batch ({len(batch)} targets) → {host}")
-            tt = time.time()
-            fs = run_sqlmap(batch, plans["sqlmap"], timeouts["sqlmap"], stealth, waf_detected=waf)
-            log("ok" if fs else "skip",
-                f"  sqlmap {round(time.time()-tt,1)}s — {len(fs)} findings")
-            return fs
+        # ── 2. Individual POST targets
+        def _sqli_post_worker(item):
+            url, post_data, stealth, waf = item
+            return run_sqlmap(url, plans["sqlmap"], timeouts["sqlmap"], stealth, AUTH, post_data=post_data, waf_detected=waf)
 
         if args.threads <= 1:
-            for host, host_targets in sqli_targets_by_host.items():
-                all_findings.extend(_sqli_host_worker(host_targets))
+            for host, host_targets in sqli_get_by_host.items():
+                all_findings.extend(_sqli_get_worker(host_targets))
+            for item in sqli_post_queue:
+                all_findings.extend(_sqli_post_worker(item))
         else:
-            with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=min(args.threads, 3)) as ex:
-                for fs in ex.map(_sqli_host_worker, list(sqli_targets_by_host.values())):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(args.threads, 3)) as ex:
+                # Run GET batches
+                for fs in ex.map(_sqli_get_worker, list(sqli_get_by_host.values())):
+                    all_findings.extend(fs)
+                # Run POST targets
+                for fs in ex.map(_sqli_post_worker, sqli_post_queue):
                     all_findings.extend(fs)
 
     duration = time.time() - t0
