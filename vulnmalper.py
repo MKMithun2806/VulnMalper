@@ -2493,14 +2493,37 @@ def run_sqlmap(targets: list[tuple[str, str]], plan: ToolPlan, timeout: int, ste
     ua = stealth.pick_ua()
     stealth_sqlmap = stealth.polite or stealth.slow or stealth.quiet
 
-    level = SQLMAP_LEVEL if SQLMAP_LEVEL is not None else (1 if stealth_sqlmap else 4)
-    risk  = SQLMAP_RISK  if SQLMAP_RISK  is not None else (1 if stealth_sqlmap else 2)
+    # ── Auto-tuning: level/risk based on strategy ────────────────────────
+    # Defaults: Level 4, Risk 2 (Balanced)
+    # Aggressive: Level 5, Risk 3
+    # Stealth/Polite: Level 1, Risk 1
+    if SQLMAP_LEVEL is not None:
+        level = SQLMAP_LEVEL
+    else:
+        if stealth.slow or stealth.polite: level = 1
+        elif not stealth.jitter:           level = 5 # "Aggressive" hint
+        else:                              level = 4
 
-    extra = ["--user-agent", ua, "--level", str(level), "--risk", str(risk)]
+    if SQLMAP_RISK is not None:
+        risk = SQLMAP_RISK
+    else:
+        if stealth.slow or stealth.polite: risk = 1
+        elif not stealth.jitter:           risk = 3 # "Aggressive" hint
+        else:                              risk = 2
+
+    extra = ["--level", str(level), "--risk", str(risk)]
+    
+    # Random-agent as a fallback, though we pass --user-agent explicitly too
+    extra += ["--random-agent"]
 
     # Tamper scripts: minimal on clean targets, evasion-focused on WAF targets
     if waf_detected:
-        tamper_scripts = ["between", "charencode", "space2comment", "randomcase"]
+        # More comprehensive tamper set for WAF evasion
+        tamper_scripts = [
+            "between", "charencode", "space2comment", "randomcase",
+            "apostrophemask", "base64encode", "multiplespaces", "unionalltounion"
+        ]
+        extra += ["--hex", "--no-cast"] # Further WAF evasion
     else:
         tamper_scripts = ["between", "space2comment"]
     extra += ["--tamper", ",".join(tamper_scripts)]
