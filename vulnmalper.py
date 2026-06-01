@@ -562,10 +562,48 @@ LOCAL_BINARIES = {
 def have(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
+def _docker_env() -> dict:
+    """Env to hand to docker subprocesses so sudo'd runs still see the
+    real user's docker config (creds + context). Without this, running
+    `sudo vulnmalper` makes docker look at /root/.docker which usually
+    has no auth and no `desktop-linux` context, breaking all pulls.
+
+    Also falls back to the local Unix socket when no DOCKER_HOST is
+    set, because WSL2 + Docker Desktop users often have a broken
+    `desktop-linux` named-pipe context (yields
+    "Failed to initialize: protocol not available")."""
+    env = os.environ.copy()
+    sudo_user = os.environ.get("SUDO_USER") or os.environ.get("DOAS_USER")
+    if sudo_user:
+        try:
+            pwd = subprocess.run(
+                ["getent", "passwd", sudo_user],
+                capture_output=True, text=True, timeout=4,
+            )
+            if pwd.returncode == 0:
+                home_dir = pwd.stdout.strip().split(":")[5]
+                if home_dir and os.path.isdir(home_dir):
+                    env["HOME"] = home_dir
+                    env.setdefault("USER", sudo_user)
+                    cfg_candidates = [
+                        os.path.join(home_dir, ".docker"),
+                        os.path.join(home_dir, ".local", "share", "docker"),
+                    ]
+                    for c in cfg_candidates:
+                        if os.path.isdir(c):
+                            env.setdefault("DOCKER_CONFIG", c)
+                            break
+        except Exception:
+            pass
+    if "DOCKER_HOST" not in env and os.path.exists("/var/run/docker.sock"):
+        env["DOCKER_HOST"] = "unix:///var/run/docker.sock"
+    return env
+
 def docker_available() -> bool:
     if not have("docker"): return False
     try:
-        p = subprocess.run(["docker","info"], capture_output=True, text=True, timeout=8)
+        p = subprocess.run(["docker","info"], capture_output=True, text=True,
+                           timeout=15, env=_docker_env())
         return p.returncode == 0
     except Exception:
         return False
@@ -595,46 +633,66 @@ def plan_tools(runner_pref: str) -> dict[str, Optional[ToolPlan]]:
         out[name] = plan
     return out
 
+def _image_candidates(image: str) -> list[str]:
+    """Return alternative image refs to try for a configured image.
+    The user may have pulled a private namespace under a slightly
+    different prefix (e.g. `ghcr.io/me/foo` vs `docker.io/me/foo` vs
+    just `me/foo`)."""
+    seen, out = set(), []
+    for ref in [image,
+                image.replace("ghcr.io/", ""),
+                image.replace("ghcr.io/", "docker.io/"),
+                image.split("/", 1)[-1] if "/" in image else image]:
+        if ref and ref not in seen:
+            seen.add(ref)
+            out.append(ref)
+    return out
+
 def ensure_docker_image(image: str, quiet: bool = False):
-    try:
-        subprocess.run(["docker","image","inspect",image],
-                       capture_output=True, text=True, timeout=10, check=True)
-        return True
-    except subprocess.TimeoutExpired as e:
-        if not quiet:
-            log("warn", f"docker image inspect timed out for {image} after 10s")
-        return False
-    except subprocess.CalledProcessError as e:
-        if not quiet:
-            details = _coerce_subprocess_text(getattr(e, "stderr", "")) or _coerce_subprocess_text(getattr(e, "stdout", ""))
-            details = details.strip()
-            if details:
-                log("info", f"Pulling docker image: {image} ({details})")
-            else:
-                log("info", f"Pulling docker image: {image}")
+    env = _docker_env()
+    for candidate in _image_candidates(image):
         try:
-            # First attempt: short timeout
-            subprocess.run(["docker", "pull", image],
-                           capture_output=True, text=True, timeout=120, check=True)
+            subprocess.run(["docker", "image", "inspect", candidate],
+                           capture_output=True, text=True, timeout=10,
+                           env=env, check=True)
             return True
         except subprocess.TimeoutExpired:
-            log("warn", f"docker pull {image} timed out (120s), retrying...")
-        except subprocess.CalledProcessError as e:
-            log("warn", f"docker pull {image} failed first attempt, retrying...")
+            if not quiet:
+                log("warn", f"docker image inspect timed out for {candidate} after 10s")
+            return False
+        except subprocess.CalledProcessError:
+            pass
+        except Exception:
+            return False
 
-        # Retry with longer timeout
-        try:
-            subprocess.run(["docker", "pull", image],
-                           capture_output=True, text=True, timeout=300, check=True)
-            return True
-        except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as e:
-            log("err", f"docker pull {image} failed both attempts")
-            return False
-        except Exception as e:
-            log("err", f"docker pull {image} error: {e}")
-            return False
-    except Exception:
-        return False
+    if not quiet:
+        log("info", f"Pulling docker image: {image}")
+    for attempt, timeout in ((1, 120), (2, 300)):
+        for candidate in _image_candidates(image):
+            try:
+                subprocess.run(["docker", "pull", candidate],
+                               capture_output=True, text=True, timeout=timeout,
+                               env=env, check=True)
+                return True
+            except subprocess.TimeoutExpired:
+                log("warn", f"docker pull {candidate} timed out ({timeout}s), retrying...")
+                break
+            except subprocess.CalledProcessError as e:
+                details = _coerce_subprocess_text(
+                    getattr(e, "stderr", "")) or _coerce_subprocess_text(
+                    getattr(e, "stdout", ""))
+                details = details.strip().splitlines()
+                snippet = details[-1] if details else ""
+                if attempt == 1:
+                    log("warn",
+                        f"docker pull {candidate} failed ({snippet or 'unknown error'}), retrying...")
+                continue
+            except Exception as e:
+                log("err", f"docker pull {candidate} error: {e}")
+                return False
+    log("err", f"docker pull {image} failed; tried {len(_image_candidates(image))} tag(s). "
+              f"Run `docker images` as the real user (or `docker login ghcr.io`) and try again.")
+    return False
 
 def warm_docker_images(plans: dict[str, Optional["ToolPlan"]]):
     """Start background pulls for docker images used by this run."""
