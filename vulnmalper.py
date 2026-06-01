@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VulnMalper v7.3.3  —  Vulnerability pipeline for NetMalper graphs.
+VulnMalper v7.3.4  —  Vulnerability pipeline for NetMalper graphs.
 
 Pipeline:
     NetMalper JSON
@@ -54,7 +54,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-VERSION = "7.3.3"
+VERSION = "7.3.4"
 
 # Background warmup state for docker images and nuclei templates.
 DOCKER_IMAGE_EVENTS: dict[str, threading.Event] = {}
@@ -1586,19 +1586,22 @@ def run_wapiti(t: WebTarget, plan: ToolPlan, timeout: int, stealth: StealthProfi
     host_dir = f"/tmp/vulnmalper_wapiti_{abs(hash(t.url))}"
     os.makedirs(host_dir, exist_ok=True)
     report = "report.json"
-    parsed_t = urllib.parse.urlparse(t.url)
-    base_url = f"{parsed_t.scheme}://{parsed_t.netloc}"
     scope = "page" if t.discovered else "folder"
 
-    extra = ["-A", stealth.pick_ua()]
+    # level: 1 = only attack params actually present in URLs/forms
+    #        2 = also inject into bare URLs (better for sparse homepages
+    #            like testasp.vulnweb.com where most URLs are static).
+    # Stealth/quiet mode stays at 1 to avoid amplifying traffic;
+    # balanced, aggressive, and plain (no stealth flag) all use 2.
+    level = 1 if stealth.quiet else 2
+
+    extra = ["--user-agent", stealth.pick_ua()]
     for h in stealth.default_headers():
-        extra += ["-H", h]
+        extra += ["--header", h]
 
     extra += [
         "--scope", scope,
-        "--base", base_url,
         "--max-links-per-page", "100",
-        "-t", "10",       # per-request timeout (was default 6)
     ]
 
     # Seed with upstream-discovered endpoints so wapiti
@@ -1611,39 +1614,59 @@ def run_wapiti(t: WebTarget, plan: ToolPlan, timeout: int, stealth: StealthProfi
         extra += ["--start", seed]
 
     if stealth.headless:
-        extra += ["--scope", "domain", "-d", "5"]
+        extra += ["--scope", "domain"]
 
-    extra += ["--module", "csrf,xss,sql,xxe,redirect,ssrf,timesql,blindsqli,wapp,nikto,htaccess,cookieflags,csp,headers"]
+    # Full wapiti 3.x attack module set. `sql` already covers both
+    # error-based and time-based; `blindsqli`/`timesql` were merged
+    # into it in 3.0 and would just be skipped with a warning if
+    # passed again. Dropped: --base, --verify-ssl, -t (all invalid
+    # in 3.x and caused argparse SystemExit(2) -> 2-second exit).
+    extra += ["--module",
+              "csrf,xss,sql,xxe,redirect,ssrf,wapp,nikto,htaccess,"
+              "cookieflags,csp,headers,backup,crlf,exec,file,"
+              "permanentxss,shellshock,spring4shell,subdomaintakeover,"
+              "takeover,upload,brute_login"]
 
     if AUTH.user and AUTH.password:
         extra += ["--auth-credential", f"{AUTH.user}%{AUTH.password}",
                   "--auth-method", "post"]
     if AUTH.cookie:
         extra += ["--cookie", AUTH.cookie]
+
+    base_args = ["-u", t.url, "-f", "json",
+                 "--flush-session", "--level", str(level),
+                 "--max-scan-time", str(min(timeout, 1200))]
     if plan.runner == "docker":
         container_dir = "/wrk"
-        args = ["-u", t.url, "-f","json","-o", f"{container_dir}/{report}",
-                "--flush-session","--level","2",
-                "--max-scan-time", str(min(timeout, 1200)), "--verify-ssl","0"] + extra
-        cmd = build_cmd(plan, args, mounts=[(host_dir, container_dir)])
+        out_arg = f"{container_dir}/{report}"
+        cmd = build_cmd(plan, base_args + ["-o", out_arg] + extra,
+                        mounts=[(host_dir, container_dir)])
     else:
-        args = ["-u", t.url, "-f","json","-o", os.path.join(host_dir, report),
-                "--flush-session","--level","2",
-                "--max-scan-time", str(min(timeout, 1200)), "--verify-ssl","0"] + extra
-        cmd = build_cmd(plan, args)
-    log("info", f"wapiti cmd: {' '.join(cmd[:12])}...")
+        cmd = build_cmd(plan,
+                        base_args + ["-o", os.path.join(host_dir, report)] + extra)
+    log("info", f"wapiti cmd: {' '.join(cmd[:8])}... (level={level}, scope={scope})")
     rc, out, err = _run(cmd, timeout + 30)
-    findings: list[Finding] = []
+
+    # Surface wapiti's actual stderr so future fast-exits are debuggable
+    # from the log alone (previously swallowed silently).
     host_out = os.path.join(host_dir, report)
+    if rc != 0:
+        snippet = (err or out).strip().splitlines()[:5]
+        log("warn", f"wapiti exit {rc} for {t.url}: " +
+                   (" | ".join(snippet) or "<empty stderr/stdout>"))
+
+    findings: list[Finding] = []
     payload = None
     if os.path.exists(host_out):
         try:
-            with open(host_out) as f: data = json.load(f)
+            with open(host_out) as f:
+                data = json.load(f)
             payload = data
         except Exception as e:
             log("warn", f"wapiti JSON parse failed for {t.url}: {e}")
     if payload is None:
         payload = _load_json_document(out) or _load_json_document(err)
+
     if payload is not None:
         for category, it in _iter_wapiti_vulnerabilities(payload):
             lvl = it.get("level", it.get("severity", 0))
@@ -1671,6 +1694,13 @@ def run_wapiti(t: WebTarget, plan: ToolPlan, timeout: int, stealth: StealthProfi
                 injectable_url = full_url
             if injectable_url not in t.injectable:
                 t.injectable.append(injectable_url)
+
+    if not findings:
+        log("warn",
+            f"wapiti produced no findings for {t.url} "
+            f"(rc={rc}, host_out_exists={os.path.exists(host_out)}, "
+            f"out={len(out)}B, err={len(err)}B, scope={scope}, level={level})")
+
     shutil.rmtree(host_dir, ignore_errors=True)
     return findings
 
