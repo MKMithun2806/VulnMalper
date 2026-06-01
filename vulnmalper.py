@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VulnMalper v7.3.1  —  Vulnerability pipeline for NetMalper graphs.
+VulnMalper v7.3.2  —  Vulnerability pipeline for NetMalper graphs.
 
 Pipeline:
     NetMalper JSON
@@ -54,7 +54,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-VERSION = "7.3.1"
+VERSION = "7.3.2"
 
 # Background warmup state for docker images and nuclei templates.
 DOCKER_IMAGE_EVENTS: dict[str, threading.Event] = {}
@@ -529,16 +529,16 @@ ALL_TOOLS = ["httpx","whatweb","wafw00f","testssl","nikto",
 
 DOCKER_IMAGES = {
     "httpx":   "projectdiscovery/httpx:latest",
-    "whatweb": "secsi/whatweb:latest",
-    "wafw00f": "secsi/wafw00f:latest",
-    "testssl": "drwetter/testssl.sh:latest",
+    "whatweb": "ghcr.io/mkmithun2806/whatweb:latest",
+    "wafw00f": "ghcr.io/mkmithun2806/wafw00f:latest",
+    "testssl": "ghcr.io/mkmithun2806/testssl.sh:latest",
     "nikto":   "ghcr.io/sullo/nikto:latest",
-    "nuclei":  "projectdiscovery/nuclei:latest",
-    "wapiti":  "cyberwatch/wapiti:latest",
-    "sqlmap":  "googlesky/sqlmap:latest",
-    "ffuf":    "secsi/ffuf:latest",
-    "feroxbuster": "epi052/feroxbuster",
-    "katana": "projectdiscovery/katana:latest",
+    "nuclei":  "ghcr.io/mkmithun2806/nuclei:latest",
+    "wapiti":  "ghcr.io/mkmithun2806/wapiti:latest",
+    "sqlmap":  "ghcr.io/mkmithun2806/sqlmap:latest",
+    "ffuf":    "ghcr.io/mkmithun2806/ffuf:latest",
+    "feroxbuster": "ghcr.io/mkmithun2806/feroxbuster:latest",
+    "katana": "ghcr.io/mkmithun2806/katana:latest",
 }
 # Some tools publish their binary under a different name inside the image:
 DOCKER_ENTRYPOINTS = {
