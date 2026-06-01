@@ -54,7 +54,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-VERSION = "7.3.4"
+VERSION = "7.3.5"
 
 # Background warmup state for docker images and nuclei templates.
 DOCKER_IMAGE_EVENTS: dict[str, threading.Event] = {}
@@ -1582,6 +1582,70 @@ WAPITI_SEV_MAP = {1:"low",2:"medium",3:"high",4:"critical",0:"info",
                   "Low":"low","Medium":"medium","High":"high",
                   "Critical":"critical","Informational":"info"}
 
+# Wapiti 3.2.10 module list. Source of truth:
+# https://github.com/wapiti-scanner/wapiti/tree/master/wapitiCore/attack (mod_*.py)
+# Dropped names that are NOT in 3.2.10: cookieflags, csp, headers, blindsqli,
+# brute_login, takeover (renamed in 3.x). `timesql` IS still a real module in
+# 3.2.10 (it is the time-based complement to error-based `sql`).
+WAPITI_MODULES_REQUESTED = (
+    "backup,brute_login_form,buster,cms,crlf,csrf,exec,file,htaccess,htp,ldap,"
+    "log4shell,methods,nikto,permanentxss,redirect,shellshock,spring4shell,sql,"
+    "ssl,ssrf,subdomaintakeover,takeover,timesql,upload,wapp,xss,xxe"
+)
+
+# Cache of "what modules does THIS wapiti image actually expose", keyed
+# by image ref. Populated lazily on first wapiti run, then reused.
+WAPITI_VALID_MODULES: Optional[set[str]] = None
+WAPITI_VALID_MODULES_IMAGE: Optional[str] = None
+
+def _wapiti_valid_modules(image: Optional[str]) -> set[str]:
+    """Ask the wapiti image for `--list-modules` and parse the names. Cached."""
+    global WAPITI_VALID_MODULES, WAPITI_VALID_MODULES_IMAGE
+    if not image:
+        return set()
+    if WAPITI_VALID_MODULES is not None and WAPITI_VALID_MODULES_IMAGE == image:
+        return WAPITI_VALID_MODULES
+    WAPITI_VALID_MODULES = set()
+    WAPITI_VALID_MODULES_IMAGE = image
+    try:
+        p = subprocess.run(
+            ["docker", "run", "--rm", "--network", "host", image, "--list-modules"],
+            capture_output=True, text=True, timeout=60, env=_docker_env(),
+        )
+        # Format:
+        #   [*] Available modules:
+        #           backup
+        #                   Uncover backup files on the web server.
+        #           brute_login_form
+        #                   ...
+        for ln in (p.stdout or "").splitlines():
+            stripped = ln.strip()
+            if not stripped or stripped.startswith("[*]") or " " in stripped:
+                continue
+            WAPITI_VALID_MODULES.add(stripped)
+        if not WAPITI_VALID_MODULES:
+            log("warn", f"wapiti --list-modules returned no module names; "
+                       f"stdout={len(p.stdout)}B stderr={len(p.stderr)}B")
+    except subprocess.TimeoutExpired:
+        log("warn", f"wapiti --list-modules timed out for {image}")
+    except Exception as e:
+        log("warn", f"wapiti --list-modules failed: {e}")
+    return WAPITI_VALID_MODULES
+
+def _wapiti_filter_modules(requested_csv: str, image: Optional[str]) -> str:
+    """Return `requested_csv` filtered against the image's actual module set.
+    Falls back to wapiti's built-in `common` keyword if everything was dropped."""
+    requested = [m.strip() for m in requested_csv.split(",") if m.strip()]
+    valid = _wapiti_valid_modules(image)
+    if not valid:
+        return requested_csv  # trust ourselves if the probe failed
+    keep   = [m for m in requested if m in valid]
+    dropped = [m for m in requested if m not in valid]
+    if dropped:
+        log("info", f"wapiti: image {image} does not expose {dropped}; "
+                   f"running {len(keep)}/{len(requested)} requested modules")
+    return ",".join(keep) if keep else "common"
+
 def run_wapiti(t: WebTarget, plan: ToolPlan, timeout: int, stealth: StealthProfile):
     host_dir = f"/tmp/vulnmalper_wapiti_{abs(hash(t.url))}"
     os.makedirs(host_dir, exist_ok=True)
@@ -1595,13 +1659,20 @@ def run_wapiti(t: WebTarget, plan: ToolPlan, timeout: int, stealth: StealthProfi
     # balanced, aggressive, and plain (no stealth flag) all use 2.
     level = 1 if stealth.quiet else 2
 
-    extra = ["--user-agent", stealth.pick_ua()]
+    # Wapiti 3.2.10 flag set (verified from `wapiti --help` in
+    # ghcr.io/mkmithun2806/wapiti:latest). Note the short forms only:
+    #   -A = user agent,  -H = header,  -t = per-request timeout,
+    #   -m/--module, --verify-ssl {0,1}, --max-scan-time, -s/--start
+    # The long forms --user-agent, --header, --start do NOT exist in 3.2.10.
+    extra = ["-A", stealth.pick_ua()]
     for h in stealth.default_headers():
-        extra += ["--header", h]
+        extra += ["-H", h]
 
     extra += [
         "--scope", scope,
         "--max-links-per-page", "100",
+        "-t", "10",                 # per-request timeout (s)
+        "--verify-ssl", "0",        # wapiti 3.2.10 valid; accepts {0,1}
     ]
 
     # Seed with upstream-discovered endpoints so wapiti
@@ -1611,31 +1682,31 @@ def run_wapiti(t: WebTarget, plan: ToolPlan, timeout: int, stealth: StealthProfi
             continue
         if not _same_netloc(seed, t.url):
             continue
-        extra += ["--start", seed]
+        extra += ["-s", seed]
 
     if stealth.headless:
         extra += ["--scope", "domain"]
 
-    # Full wapiti 3.x attack module set. `sql` already covers both
-    # error-based and time-based; `blindsqli`/`timesql` were merged
-    # into it in 3.0 and would just be skipped with a warning if
-    # passed again. Dropped: --base, --verify-ssl, -t (all invalid
-    # in 3.x and caused argparse SystemExit(2) -> 2-second exit).
-    extra += ["--module",
-              "csrf,xss,sql,xxe,redirect,ssrf,wapp,nikto,htaccess,"
-              "cookieflags,csp,headers,backup,crlf,exec,file,"
-              "permanentxss,shellshock,spring4shell,subdomaintakeover,"
-              "takeover,upload,brute_login"]
+    # Full wapiti 3.x attack module set, filtered against the actual
+    # `--list-modules` output of the image. `--base` does NOT exist in
+    # 3.2.10 (`-u` is the base).
+    modules_csv = _wapiti_filter_modules(WAPITI_MODULES_REQUESTED, plan.image)
+    extra += ["--module", modules_csv]
 
     if AUTH.user and AUTH.password:
-        extra += ["--auth-credential", f"{AUTH.user}%{AUTH.password}",
+        # wapiti 3.2.10 takes --auth-user/--auth-password/--auth-method,
+        # not --auth-credential (the latter is a 2.x flag).
+        extra += ["--auth-user", AUTH.user,
+                  "--auth-password", AUTH.password,
                   "--auth-method", "post"]
     if AUTH.cookie:
-        extra += ["--cookie", AUTH.cookie]
+        extra += ["-C", AUTH.cookie]   # 3.2.10: -C COOKIE_VALUE, not --cookie
 
     base_args = ["-u", t.url, "-f", "json",
                  "--flush-session", "--level", str(level),
-                 "--max-scan-time", str(min(timeout, 1200))]
+                 "--max-scan-time", str(min(timeout, 1200)),
+                 "-v", "1",                  # progress to stdout: "N URLs scanned"
+                 "--color"]                  # disable ANSI escape codes
     if plan.runner == "docker":
         container_dir = "/wrk"
         out_arg = f"{container_dir}/{report}"
@@ -1647,13 +1718,55 @@ def run_wapiti(t: WebTarget, plan: ToolPlan, timeout: int, stealth: StealthProfi
     log("info", f"wapiti cmd: {' '.join(cmd[:8])}... (level={level}, scope={scope})")
     rc, out, err = _run(cmd, timeout + 30)
 
-    # Surface wapiti's actual stderr so future fast-exits are debuggable
-    # from the log alone (previously swallowed silently).
+    # Persist the full wapiti output (banner is ~416B and swamps the
+    # 5-line snippet). Always keep the log; don't put it in host_dir
+    # because that gets rmtree'd below.
+    log_path = f"/tmp/vulnmalper_wapiti_{abs(hash(t.url))}.log"
+    try:
+        with open(log_path, "w") as _f:
+            _f.write(f"$ {' '.join(cmd)}\n--- rc={rc} ---\n--- stdout ({len(out)}B) ---\n{out}\n"
+                     f"--- stderr ({len(err)}B) ---\n{err}\n")
+    except Exception:
+        pass
+
+    # Surface a few progress lines so a slow-but-alive run is visibly
+    # alive instead of looking hung. Pick lines containing "URLs scanned"
+    # or percentage markers.
+    progress = [ln.strip() for ln in out.splitlines()
+                if "URLs scanned" in ln or "scan progress" in ln.lower()
+                or "crawling" in ln.lower() or "%" in ln]
+    for ln in progress[-3:]:
+        if ln and ln != "[*] You are lucky! Full moon tonight.":
+            log("info", f"wapiti: {ln}")
+
+    # Find the actual error line(s) in the noisy banner. Argparse
+    # failures look like "unrecognized arguments: --foo" or
+    # "the following arguments are required: -u" or just "usage:".
+    blob = (err + "\n" + out)
+    error_lines = [ln.strip() for ln in blob.splitlines()
+                   if any(k in ln.lower() for k in
+                          ("unrecognized", "error:", "usage:", "no such",
+                           "invalid", "required:", "ambiguous",
+                           "argument --", "unknown"))]
+    # Drop banner-art duplicates.
+    seen, dedup = set(), []
+    for ln in error_lines:
+        if ln and ln not in seen:
+            seen.add(ln); dedup.append(ln)
+    error_lines = dedup[:8]
+
     host_out = os.path.join(host_dir, report)
     if rc != 0:
-        snippet = (err or out).strip().splitlines()[:5]
-        log("warn", f"wapiti exit {rc} for {t.url}: " +
-                   (" | ".join(snippet) or "<empty stderr/stdout>"))
+        log("warn", f"wapiti exit {rc} for {t.url}")
+        if error_lines:
+            for ln in error_lines:
+                log("warn", f"  wapiti: {ln}")
+        else:
+            tail = (err or out).strip().splitlines()[-5:]
+            for ln in tail:
+                if ln.strip():
+                    log("warn", f"  wapiti: {ln.strip()}")
+        log("warn", f"  full wapiti log: {log_path}")
 
     findings: list[Finding] = []
     payload = None
@@ -1699,7 +1812,8 @@ def run_wapiti(t: WebTarget, plan: ToolPlan, timeout: int, stealth: StealthProfi
         log("warn",
             f"wapiti produced no findings for {t.url} "
             f"(rc={rc}, host_out_exists={os.path.exists(host_out)}, "
-            f"out={len(out)}B, err={len(err)}B, scope={scope}, level={level})")
+            f"out={len(out)}B, err={len(err)}B, scope={scope}, level={level}, "
+            f"log={log_path})")
 
     shutil.rmtree(host_dir, ignore_errors=True)
     return findings
