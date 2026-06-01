@@ -1555,7 +1555,7 @@ def run_wapiti(t: WebTarget, plan: ToolPlan, timeout: int, stealth: StealthProfi
     if stealth.headless:
         extra += ["--scope", "domain", "-d", "5"]
 
-    extra += ["--module", "csrf,xss,sql,xxe,redirect,ssrf,timesql,blindsql,wapp,nikto,htaccess,cookieflags,csp,headers,http_headers"]
+    extra += ["--module", "csrf,xss,sql,xxe,redirect,ssrf,timesql,blindsqli,wapp,nikto,htaccess,cookieflags,csp,headers"]
 
     if AUTH.user and AUTH.password:
         extra += ["--auth-credential", f"{AUTH.user}%{AUTH.password}",
@@ -1566,12 +1566,12 @@ def run_wapiti(t: WebTarget, plan: ToolPlan, timeout: int, stealth: StealthProfi
         container_dir = "/wrk"
         args = ["-u", t.url, "-f","json","-o", f"{container_dir}/{report}",
                 "--flush-session","--level","2",
-                "--max-scan-time", str(min(timeout, 1200)), "-S","paranoid"] + extra
+                "--max-scan-time", str(min(timeout, 1200)), "--verify-ssl","0"] + extra
         cmd = build_cmd(plan, args, mounts=[(host_dir, container_dir)])
     else:
         args = ["-u", t.url, "-f","json","-o", os.path.join(host_dir, report),
                 "--flush-session","--level","2",
-                "--max-scan-time", str(min(timeout, 1200)), "-S","paranoid"] + extra
+                "--max-scan-time", str(min(timeout, 1200)), "--verify-ssl","0"] + extra
         cmd = build_cmd(plan, args)
     log("info", f"wapiti cmd: {' '.join(cmd[:12])}...")
     rc, out, err = _run(cmd, timeout + 30)
