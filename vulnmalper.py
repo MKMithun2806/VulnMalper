@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VulnMalper v7.3.4  —  Vulnerability pipeline for NetMalper graphs.
+VulnMalper v7.3.6  —  Vulnerability pipeline for NetMalper graphs.
 
 Pipeline:
     NetMalper JSON
@@ -54,7 +54,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-VERSION = "7.3.5"
+VERSION = "7.3.6"
 
 # Background warmup state for docker images and nuclei templates.
 DOCKER_IMAGE_EVENTS: dict[str, threading.Event] = {}
@@ -226,6 +226,7 @@ class AuthProfile:
     user: Optional[str] = None
     password: Optional[str] = None
     cookie: Optional[str] = None
+    authed_cookie: Optional[str] = None
 
 AUTH = AuthProfile()
 SQLMAP_LEVEL: Optional[int] = None
@@ -372,6 +373,8 @@ class WebTarget:
     # auto-mode strategy cache (set after Phase 1 when enabled)
     auto_strategy: Optional[str] = None
     auto_reason: str = ""
+    # session cookie from a successful default-login finding; used for sqlmap
+    authed_cookie: Optional[str] = None
 
 @dataclass
 class ServiceTarget:
@@ -1485,7 +1488,7 @@ def run_nikto(t: WebTarget, plan: ToolPlan, timeout: int, stealth: StealthProfil
     shutil.rmtree(host_dir, ignore_errors=True)
     return findings
 
-def run_nuclei(targets: list[str], plan: ToolPlan, severity: str, timeout: Optional[int], stealth: StealthProfile, auth: AuthProfile):
+def run_nuclei(targets: list[WebTarget], plan: ToolPlan, severity: str, timeout: Optional[int], stealth: StealthProfile, auth: AuthProfile):
     """
     Run nuclei on a list of URLs for a single host.
     """
@@ -1499,8 +1502,9 @@ def run_nuclei(targets: list[str], plan: ToolPlan, severity: str, timeout: Optio
     host_dir = tempfile.mkdtemp(prefix="vulnmalper_nuclei_", dir="/tmp")
     os.chmod(host_dir, 0o777)
     targets_file = os.path.join(host_dir, "targets.txt")
+    target_urls = [t.url for t in targets]
     with open(targets_file, "w") as f:
-        for u in targets: f.write(f"{u}\n")
+        for u in target_urls: f.write(f"{u}\n")
 
     args = ["-l", targets_file if plan.runner != "docker" else "/wrk/targets.txt", 
             "-jsonl","-silent","-nc",
@@ -1509,11 +1513,13 @@ def run_nuclei(targets: list[str], plan: ToolPlan, severity: str, timeout: Optio
             "-timeout","15","-retries","2","-rl",str(rl),
             "-H", f"User-Agent: {stealth.pick_ua()}"]
     
-    if any(u.startswith("http://") for u in targets):
+    if any(t.url.startswith("http://") for t in targets):
         args += ["-ept", "ssl,dns"]
     args += ["-retries", "2", "-mhe", "30"]
     
-    cookie_val = auth.cookie or auth_cookie_value()
+    # Prefer a session cookie obtained from a successful default-login finding
+    # so nuclei can reach authenticated surfaces when available.
+    cookie_val = getattr(auth, "authed_cookie", None) or auth.cookie or auth_cookie_value()
     if cookie_val: args += ["-H", f"Cookie: {cookie_val}"]
     if auth.user and auth.password:
         args += ["--auth-credential", f"{auth.user}%{auth.password}", "--auth-method", "post"]
@@ -1525,7 +1531,7 @@ def run_nuclei(targets: list[str], plan: ToolPlan, severity: str, timeout: Optio
     nuclei_mounts = []
     if plan.runner == "docker":
         template_dir = _nuclei_template_host_dir()
-        if not _ensure_nuclei_templates_ready(plan, targets[0]):
+        if not _ensure_nuclei_templates_ready(plan, targets[0].url):
             return []
         nuclei_mounts.append((template_dir, "/root/nuclei-templates"))
         nuclei_mounts.append((host_dir, "/wrk"))
@@ -1543,7 +1549,7 @@ def run_nuclei(targets: list[str], plan: ToolPlan, severity: str, timeout: Optio
 
     cmd = build_cmd(plan, args, mounts=nuclei_mounts)
 
-    log("run", f"nuclei batch ({len(targets)} targets) → {targets[0][:40]}...")
+    log("run", f"nuclei batch ({len(targets)} targets) → {targets[0].url[:40]}...")
     rc, out, err = _run(cmd, timeout)
     findings: list[Finding] = []
     INJ_TAGS = {"sqli","sql-injection","injection","xss","ssti","lfi","rfi"}
@@ -1567,7 +1573,7 @@ def run_nuclei(targets: list[str], plan: ToolPlan, severity: str, timeout: Optio
         except Exception: continue
         info = j.get("info", {})
         sev  = (info.get("severity") or "unknown").lower()
-        matched = j.get("matched-at") or targets[0]
+        matched = j.get("matched-at") or targets[0].url
         findings.append(Finding(
             target=matched, tool="nuclei", severity=sev,
             title=info.get("name") or j.get("template-id") or "nuclei finding",
@@ -1575,6 +1581,33 @@ def run_nuclei(targets: list[str], plan: ToolPlan, severity: str, timeout: Optio
             reference=", ".join(info.get("reference") or []),
             raw=j,
         ))
+        # If this is a default-login finding, extract the session cookie from
+        # the response headers and attach it to matching WebTarget instances so
+        # sqlmap can reach authenticated surfaces in Phase 3.
+        tags = info.get("tags") or []
+        template_id = j.get("template-id") or ""
+        is_default_login = (
+            "default-login" in tags
+            or "default-credentials" in tags
+            or "default-login" in template_id
+        )
+        if is_default_login:
+            resp_headers = j.get("response") or ""
+            cookie = None
+            for hdr_line in resp_headers.splitlines():
+                if hdr_line.lower().startswith("set-cookie:"):
+                    cookie = hdr_line.split(":", 1)[1].strip().split(";")[0]
+                    break
+            if not cookie:
+                # nuclei sometimes puts extracted values in extracted-results
+                extracted = j.get("extracted-results") or []
+                if extracted:
+                    cookie = extracted[0]
+            if cookie:
+                log("info", f"nuclei: default-login cookie captured for {matched}: {cookie[:40]}...")
+                for wt in targets:
+                    if _same_netloc(matched, wt.url):
+                        wt.authed_cookie = cookie
     shutil.rmtree(host_dir, ignore_errors=True)
     return findings
 
@@ -1699,7 +1732,9 @@ def run_wapiti(t: WebTarget, plan: ToolPlan, timeout: int, stealth: StealthProfi
         extra += ["--auth-user", AUTH.user,
                   "--auth-password", AUTH.password,
                   "--auth-method", "post"]
-    if AUTH.cookie:
+    if getattr(t, "authed_cookie", None):
+        extra += ["-C", t.authed_cookie]   # 3.2.10: -C COOKIE_VALUE, not --cookie
+    elif AUTH.cookie:
         extra += ["-C", AUTH.cookie]   # 3.2.10: -C COOKIE_VALUE, not --cookie
 
     base_args = ["-u", t.url, "-f", "json",
@@ -1795,6 +1830,24 @@ def run_wapiti(t: WebTarget, plan: ToolPlan, timeout: int, stealth: StealthProfi
                 detail=(f"{method} {path}\n{info_}").strip(),
                 raw=it,
             ))
+            # If wapiti cracked a login form, pull the session cookie out of
+            # the finding detail and store it on the target for sqlmap.
+            if "brute_login" in category.lower() or "default" in category.lower():
+                cookie = it.get("set-cookie") or it.get("cookie") or it.get("session")
+                if not cookie:
+                    # Some wapiti versions embed it in the info string as
+                    # "Cookie: ..." or a token containing the session value.
+                    for tok in (info_ or "").split():
+                        low = tok.lower()
+                        if low.startswith("cookie:"):
+                            cookie = tok.split(":", 1)[1].strip().rstrip(",;")
+                            break
+                        if "=" in tok and "session" in low:
+                            cookie = tok.strip().rstrip(",;")
+                            break
+                if cookie:
+                    log("info", f"wapiti: default-login cookie captured for {full_url}: {cookie[:40]}...")
+                    t.authed_cookie = cookie
             # Add URLs with parameters to injectable for sqlmap testing.
             # Include SQLi, XSS, and any other parameter-based vulnerabilities.
             if not _same_netloc(full_url, t.url):
@@ -2696,7 +2749,7 @@ def run_sqlmap(url: str, plan: ToolPlan, timeout: int, stealth: StealthProfile, 
     else:
         extra += ["--tamper", "between,space2comment"]
 
-    cookie_val = auth.cookie or auth_cookie_value() # Fallback to global helper for now
+    cookie_val = getattr(auth, "authed_cookie", None) or auth.cookie or auth_cookie_value()
     if cookie_val:
         extra += ["--cookie", cookie_val]
 
@@ -2757,7 +2810,7 @@ def run_sqlmap_batch(urls: list[str], plan: ToolPlan, timeout: int, stealth: Ste
     else:
         extra += ["--tamper", "between,space2comment"]
 
-    cookie_val = auth.cookie or auth_cookie_value()
+    cookie_val = getattr(auth, "authed_cookie", None) or auth.cookie or auth_cookie_value()
     if cookie_val: extra += ["--cookie", cookie_val]
     hdrs = stealth.default_headers()
     if hdrs: extra += ["--headers", "\n".join(hdrs)]
@@ -3708,7 +3761,7 @@ def main():
         
         # ── 1. Batch Nuclei
         if plans["nuclei"]:
-            scannable = [t.url for t in host_targets if _is_worth_scanning(t.url)]
+            scannable = [t for t in host_targets if _is_worth_scanning(t.url)]
             if scannable:
                 fs = run_nuclei(scannable, plans["nuclei"], args.severity, timeouts["nuclei"], local_stealth, AUTH)
                 out.extend(fs)
@@ -3787,8 +3840,8 @@ def main():
     _phase("Phase 3 — Verifying SQLi candidates (sqlmap)")
 
     # Group GET targets by host for batching; POST targets run individually.
-    sqli_get_by_host: dict[str, list[tuple[str, StealthProfile, bool]]] = {}
-    sqli_post_queue: list[tuple[str, str, StealthProfile, bool]] = []
+    sqli_get_by_host: dict[str, list[tuple[str, StealthProfile, bool, AuthProfile]]] = {}
+    sqli_post_queue: list[tuple[str, str, StealthProfile, bool, AuthProfile]] = []
     seen_sqli: set[str] = set()
 
     for t in targets:
@@ -3805,15 +3858,24 @@ def main():
         if not _is_worth_scanning(t.url):
             continue
 
+        target_auth = AUTH
+        if t.authed_cookie:
+            target_auth = AuthProfile(
+                user=AUTH.user, password=AUTH.password,
+                cookie=AUTH.cookie, authed_cookie=t.authed_cookie
+            )
+            if not AUTH.cookie:
+                log("info", f"sqlmap: using authed session cookie for {t.url}")
+
         for url, post_data, method in build_sqlmap_targets(t, local_stealth):
             key = f"{url}|{post_data}"
             if key not in seen_sqli:
                 seen_sqli.add(key)
                 if post_data:
-                    sqli_post_queue.append((url, post_data, local_stealth, bool(t.waf)))
+                    sqli_post_queue.append((url, post_data, local_stealth, bool(t.waf), target_auth))
                 else:
                     host = urllib.parse.urlparse(url).netloc
-                    sqli_get_by_host.setdefault(host, []).append((url, local_stealth, bool(t.waf)))
+                    sqli_get_by_host.setdefault(host, []).append((url, local_stealth, bool(t.waf), target_auth))
 
     if not plans["sqlmap"]:
         log("skip", "sqlmap unavailable — skipping phase 3")
@@ -3822,15 +3884,20 @@ def main():
     else:
         # ── 1. Batch GET targets
         def _sqli_get_worker(host_targets):
-            urls = [u for u, s, w in host_targets]
-            # Use stealth/waf from first target in batch
-            _, stealth, waf = host_targets[0]
-            return run_sqlmap_batch(urls, plans["sqlmap"], timeouts["sqlmap"], stealth, AUTH, waf_detected=waf)
+            urls = [u for u, s, w, a in host_targets]
+            # Use stealth/waf/auth from the first target in the batch. If any
+            # target in the batch has a captured login cookie, prefer it.
+            _, stealth, waf, auth = host_targets[0]
+            for _, _, _, candidate_auth in host_targets:
+                if getattr(candidate_auth, "authed_cookie", None):
+                    auth = candidate_auth
+                    break
+            return run_sqlmap_batch(urls, plans["sqlmap"], timeouts["sqlmap"], stealth, auth, waf_detected=waf)
 
         # ── 2. Individual POST targets
         def _sqli_post_worker(item):
-            url, post_data, stealth, waf = item
-            return run_sqlmap(url, plans["sqlmap"], timeouts["sqlmap"], stealth, AUTH, post_data=post_data, waf_detected=waf)
+            url, post_data, stealth, waf, auth = item
+            return run_sqlmap(url, plans["sqlmap"], timeouts["sqlmap"], stealth, auth, post_data=post_data, waf_detected=waf)
 
         if args.threads <= 1:
             for host, host_targets in sqli_get_by_host.items():
