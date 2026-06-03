@@ -11,7 +11,7 @@ VulnMalper automates a multi-stage security auditing workflow: **Fingerprint →
 
 ---
 
-## 🚀 The Pipeline
+## The Pipeline
 
 VulnMalper orchestrates a suite of industry-standard tools, handling dependencies automatically via Docker if they aren't found locally.
 
@@ -32,7 +32,7 @@ graph TD
     NK -- "Injectable URLs" --> SM
 ```
 
-### 🧠 Smart Features
+### Smart Features
 
 *   **Auto-Runner:** Use `--runner auto` (default) to run tools locally if present, falling back to official Docker images otherwise.
 *   **Session Handover:** Automatically captures session cookies from successful `nuclei` or `wapiti` login findings and passes them to `sqlmap` for authenticated scanning.
