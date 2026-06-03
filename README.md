@@ -32,6 +32,12 @@ graph TD
     NK -- "Injectable URLs" --> SM
 ```
 
+---
+
+<img width="2559" height="1599" alt="image" src="https://github.com/user-attachments/assets/5af9fa3b-9604-4d7b-bf4c-bcf8f324eb28" />
+
+---
+
 ### Smart Features
 
 *   **Auto-Runner:** Use `--runner auto` (default) to run tools locally if present, falling back to official Docker images otherwise.
