@@ -84,7 +84,7 @@ go install github.com/projectdiscovery/katana/cmd/katana@latest
 
 ---
 
-## 🛠️sage
+## Usage
 
 ```bash
 # Basic run with a NetMalper graph
