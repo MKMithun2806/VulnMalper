@@ -1,116 +1,121 @@
-# VulnMalper
+# 🛡️ VulnMalper
 
-**Vulnerability pipeline that eats [NetMalper](https://github.com/MKMithun2806/NetMalper) graphs.**
+[![Version](https://img.shields.io/badge/version-7.3.6-blue.svg)](https://github.com/MKMithun2806/VulnMalper)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![Docker](https://img.shields.io/badge/docker-ready-emerald.svg)](https://www.docker.com/)
 
-Fingerprint → Scan → Verify, with every stage feeding the next.
+**The ultimate vulnerability pipeline that eats [NetMalper](https://github.com/MKMithun2806/NetMalper) graphs for breakfast.**
 
-```
-NetMalper JSON
-    │
-    ├── phase 0    → service vulnerabilities (SSH/FTP/SMB/MySQL/...)
-    ├── httpx        → all HTTP targets       (always — alive + tech)
-    ├── whatweb      → all HTTP targets       (always — tech stack)
-    ├── wafw00f      → all HTTP targets       (always — WAF detection)
-    ├── testssl.sh   → port 443/8443 only     (TLS bugs)
-    ├── nikto        → port 80/443/8080/8443  (web server misconfig)
-    ├── nuclei       → all HTTP targets       (CVE / misconfig templates)
-    ├── wapiti       → all HTTP targets       (active XSS/SSRF/RCE/XXE/LFI)
-    └── sqlmap       → ONLY endpoints surfaced by upstream tools — no
-                       blind spray.
-```
-
-Every tool runs **locally** if present, else via its **official Docker image** (auto-pulled).
-
-Output: one clean **Markdown** report + a colored console summary. No JSON, no bloat.
+VulnMalper automates a multi-stage security auditing workflow: **Fingerprint → Scan → Verify**. Every stage intelligently feeds the next, ensuring maximum coverage with zero blind spraying.
 
 ---
 
-## Install
+## 🚀 The Pipeline
 
-### From .deb (recommended)
+VulnMalper orchestrates a suite of industry-standard tools, handling dependencies automatically via Docker if they aren't found locally.
 
-```bash
-URL=$(curl -s https://api.github.com/repos/MKMithun2806/VulnMalper/releases/latest | grep browser_download_url | grep .deb | cut -d '"' -f 4) && \
-curl -L -o vulnmalper.deb "$URL" && \
-sudo apt install -y ./vulnmalper.deb && \
-sudo apt-get install -f -y && \
-rm -f vulnmalper.deb
+```mermaid
+graph TD
+    JSON[NetMalper JSON] --> P0[Phase 0: Service Vulns]
+    P0 --> HTTPX[httpx: Tech & Status]
+    HTTPX --> WW[whatweb: Tech Stack]
+    HTTPX --> WAF[wafw00f: WAF Detection]
+    HTTPX --> KAT[katana: Advanced Crawling]
+    KAT --> P2[Phase 2: Scanning]
+    WW & WAF --> P2
+    P2 --> TS[testssl.sh: TLS Bugs]
+    P2 --> NK[nikto: Misconfigs]
+    P2 --> NC[nuclei: CVEs & Templates]
+    P2 --> WP[wapiti: Active Fuzzing]
+    NC & WP -- "Captured Sessions" --> SM[sqlmap: Targeted SQLi]
+    NK -- "Injectable URLs" --> SM
 ```
 
-This drops `vulnmalper` on your `PATH`, a man page (`man vulnmalper`), and bash completion. Python 3.9+ is the only hard dep.
+### 🧠 Smart Features
 
-### From source
+*   **Auto-Runner:** Use `--runner auto` (default) to run tools locally if present, falling back to official Docker images otherwise.
+*   **Session Handover:** Automatically captures session cookies from successful `nuclei` or `wapiti` login findings and passes them to `sqlmap` for authenticated scanning.
+*   **Stealth Profiles:** Randomized User-Agents and headers to avoid simple pattern-based detection.
+*   **WAF Awareness:** Automatically detects WAFs and adjusts tool behavior (e.g., adding SQLMap tamper scripts).
+*   **Zero Bloat:** Outputs a clean, actionable **Markdown report** and a high-signal console summary.
+
+---
+
+## 📦 Installation
+
+### 1. Quick Install (Debian/Ubuntu)
+
+```bash
+URL=$(curl -s https://api.github.com/repos/MKMithun2806/VulnMalper/releases/latest | grep browser_download_url | grep .deb | cut -d '"' -f 4)
+curl -L -o vulnmalper.deb "$URL"
+sudo apt install -y ./vulnmalper.deb
+rm vulnmalper.deb
+```
+*This installs the `vulnmalper` command, man pages, and bash completion.*
+
+### 2. From Source
 
 ```bash
 git clone https://github.com/MKMithun2806/VulnMalper
 cd VulnMalper
-python3 vulnmalper.py graph.json           # just run it
-# or build your own .deb:
-./build_deb.sh                             # needs dpkg-dev
+# No python dependencies! Just standard library.
+./vulnmalper.py --help
 ```
 
-### Scanner tools
+### 3. External Tool Dependencies
 
-You don't have to install any of them — `--runner auto` (default) will pull
-Docker images for anything missing. If you want them local:
+VulnMalper automatically pulls Docker images for missing tools. However, for local execution, you can install them manually:
 
 ```bash
 sudo apt install nikto sqlmap whatweb wafw00f
 pip install wapiti3
+# Go-based tools
 go install github.com/projectdiscovery/httpx/cmd/httpx@latest
 go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
 go install github.com/projectdiscovery/katana/cmd/katana@latest
-git clone --depth 1 https://github.com/drwetter/testssl.sh.git \
-  && sudo ln -s "$PWD/testssl.sh/testssl.sh" /usr/local/bin/testssl.sh
 ```
 
-Docker images used when local binaries are missing:
-`projectdiscovery/httpx`, `secsi/whatweb`, `secsi/wafw00f`,
-`drwetter/testssl.sh`, `sullo/nikto`, `projectdiscovery/nuclei`,
-`cyberwatch/wapiti`, `googlesky/sqlmap`, `projectdiscovery/katana`.
+---
 
-## Usage
+## 🛠️ Usage
 
 ```bash
-netmalper example.com --out example.json     # recon (NetMalper)
-vulnmalper example.json                      # scan  (VulnMalper)
+# Basic run with a NetMalper graph
+vulnmalper targets.json
+
+# Authenticated scan with session handover
+vulnmalper targets.json --auth-user admin --auth-pass password123
+
+# Focused scan with high severity only
+vulnmalper targets.json --only nuclei,sqlmap --severity high
 ```
 
-### Flags
+### Key Flags
 
-| Flag | Effect |
-|------|--------|
-| `--runner auto` | **Default.** Local-first, Docker fallback, per tool. |
-| `--runner local` | Skip any tool not installed locally. |
-| `--runner docker` | Force Docker for every tool. |
-| `--only nuclei,wapiti` | Restrict to a subset of pipeline stages. |
-| `--severity medium` | Minimum severity kept from nuclei. |
-| `--auth-user USER --auth-pass PASS` | Enable authenticated scanning for supported tools. |
-| `--auth-cookie NAME=VALUE` | Use a session cookie for authenticated scanning. |
-| `--sqlmap-level N` / `--sqlmap-risk N` | Override sqlmap depth/risk defaults. |
-| `--threads 5` | Parallel target workers. |
-| `--max-targets 10` | Cap how many targets get scanned. |
-| `--out NAME` | Writes `NAME.md`. Default: `vulnmalper_<target>_<ts>.md`. |
-| `--httpx-timeout`, `--whatweb-timeout`, `--wafw00f-timeout`, `--testssl-timeout`, `--nikto-timeout`, `--nuclei-timeout`, `--wapiti-timeout`, `--sqlmap-timeout`, `--katana-timeout` | Per-tool timeouts (seconds). |
+| Flag | Description |
+| :--- | :--- |
+| `--runner` | `auto` (default), `local`, or `docker`. |
+| `--only` | Comma-separated list of tools to run. |
+| `--threads` | Number of parallel target workers (default: 5). |
+| `--severity` | Minimum nuclei severity to report (`info`, `low`, `medium`, `high`, `critical`). |
+| `--out` | Custom name for the Markdown report. |
 
-## How smart dispatch works
+---
 
-1. **Phase 1 — Fingerprint.** `httpx` probes liveness + tech on every URL. `whatweb` + `wafw00f` run in parallel on alive targets. Dead targets are dropped. WAF annotations are attached to each target.
-2. **Phase 1.5 — Crawl.** `katana` discovers extra endpoints before fuzzing starts, then the new URLs are deduped and added to the phase 2 target pool.
-3. **Phase 2 — Scan.** `testssl.sh` runs on TLS ports (443/8443) only. `nikto` runs on classic web ports (80/443/8080/8443) only. `nuclei` + `wapiti` run on every alive HTTP target. Injection-flavored URLs surfaced by these tools get queued for phase 3.
-4. **Phase 3 — Verify.** `sqlmap` runs only against the curated queue — NetMalper's query-param endpoints + anything nuclei/nikto/wapiti surfaced as sqli/injection-tagged. No blind `?=` spraying.
+## 🏗️ Building from Source
 
-## Building the .deb
+To build your own `.deb` package:
 
 ```bash
-./build_deb.sh                # reads VERSION from vulnmalper.py
-./build_deb.sh 7.0.0          # override version
-# → dist/vulnmalper_<version>_all.deb
+./build_deb.sh 7.3.6
 ```
+*Requires `dpkg-dev`.*
 
-Requires `dpkg-dev` (`sudo apt install dpkg-dev`). Optionally `fakeroot` for
-clean ownership; the script auto-detects it.
+---
 
-## License
+## 📄 License
 
-MIT. Pair it with NetMalper. Crush some boxes.
+MIT © [MKMithun](https://github.com/MKMithun2806)
+
+*Pairs perfectly with [NetMalper](https://github.com/MKMithun2806/NetMalper). Crush some boxes.*
