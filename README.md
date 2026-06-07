@@ -44,6 +44,7 @@ graph TD
 *   **Session Handover:** Automatically captures session cookies from successful `nuclei` or `wapiti` login findings and passes them to `sqlmap` for authenticated scanning.
 *   **Stealth Profiles:** Randomized User-Agents and headers to avoid simple pattern-based detection.
 *   **WAF Awareness:** Automatically detects WAFs and adjusts tool behavior (e.g., adding SQLMap tamper scripts).
+*   **Proxy Pool Rotation:** Load 2-15 proxies from a file with `--proxy-file`; tool launches rotate round-robin, HTTP proxies are reused for Nikto, and active proxy mode scales tool timeouts by 2.5x.
 *   **Zero Bloat:** Outputs a clean, actionable **Markdown report** and a high-signal console summary.
 
 ---
@@ -105,7 +106,10 @@ vulnmalper targets.json --only nuclei,sqlmap --severity high
 | `--only` | Comma-separated list of tools to run. |
 | `--threads` | Number of parallel target workers (default: 5). |
 | `--severity` | Minimum nuclei severity to report (`info`, `low`, `medium`, `high`, `critical`). |
+| `--proxy-file` | File with one proxy per line. Use `http://host:port` or `socks5://host:port` entries. |
 | `--out` | Custom name for the Markdown report. |
+
+Proxy mode is best paired with a small pool of fresh exits. VulnMalper will reject files outside the 2-15 proxy range and automatically slow the configured scanner timeouts when a pool is active.
 
 ---
 

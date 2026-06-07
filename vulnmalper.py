@@ -229,6 +229,52 @@ class AuthProfile:
     authed_cookie: Optional[str] = None
 
 AUTH = AuthProfile()
+
+class ProxyPool:
+    """Round-robin proxy rotator. Thread-safe."""
+    def __init__(self, proxies: list[str]):
+        self._all = proxies
+        self._http = [p for p in proxies if p.startswith("http://") or p.startswith("https://")]
+        self._idx = 0
+        self._lock = threading.Lock()
+
+    def next(self) -> Optional[str]:
+        if not self._all:
+            return None
+        with self._lock:
+            p = self._all[self._idx % len(self._all)]
+            self._idx += 1
+            return p
+
+    def next_http_only(self) -> Optional[str]:
+        if not self._http:
+            return None
+        with self._lock:
+            p = self._http[self._idx % len(self._http)]
+            self._idx += 1
+            return p
+
+    def __bool__(self):
+        return bool(self._all)
+
+PROXY_POOL: ProxyPool = ProxyPool([])
+
+def _apply_proxy(cmd: list[str], proxy: Optional[str], tool: str) -> list[str]:
+    if not proxy:
+        return cmd
+    flags: dict[str, list[str]] = {
+        "httpx":       ["--http-proxy", proxy],
+        "nuclei":      ["-proxy", proxy],
+        "wapiti":      ["--proxy", proxy],
+        "sqlmap":      ["--proxy", proxy],
+        "nikto":       ["-useproxy", proxy],
+        "ffuf":        ["-x", proxy],
+        "feroxbuster": ["--proxy", proxy],
+        "katana":      ["-proxy", proxy],
+        "whatweb":     [f"--proxy={proxy}"],
+    }
+    return cmd + flags.get(tool, [])
+
 SQLMAP_LEVEL: Optional[int] = None
 SQLMAP_RISK: Optional[int] = None
 
@@ -1026,6 +1072,7 @@ def run_httpx(targets: list[WebTarget], plan: ToolPlan, timeout: int, stealth: S
     urls = "\n".join(t.url for t in targets)
     args = ["-silent","-json","-l","-","-nc","-no-color","-timeout","10",
             "-tech-detect","-status-code","-title","-server","-follow-redirects"]
+    base_args = list(args)
     # Stealth: random browser UA + extra (jittered) headers on every probe.
     args += ["-H", f"User-Agent: {stealth.pick_ua()}"]
     for h in stealth.default_headers():
@@ -1068,14 +1115,17 @@ def run_httpx(targets: list[WebTarget], plan: ToolPlan, timeout: int, stealth: S
                 detail=" · ".join(detail_parts), raw=j,
             ))
 
+    proxy = PROXY_POOL.next()
+    args = _apply_proxy(args, proxy, "httpx")
     cmd  = build_cmd(plan, args)
     rc, out, err = _run(cmd, timeout, stdin_data=urls)
     _parse_httpx_output(out)
     if targets and not findings:
         log("warn", "httpx returned 0 results, falling back to direct probing")
-        single_args = args[:2] + args[4:]
+        single_args = base_args[:2] + base_args[4:]
         for t in targets:
-            cmd = build_cmd(plan, single_args + ["-u", t.url])
+            _fb_args = _apply_proxy(single_args + ["-u", t.url], PROXY_POOL.next(), "httpx")
+            cmd = build_cmd(plan, _fb_args)
             rc, out, err = _run(cmd, timeout)
             _parse_httpx_output(out)
     return findings
@@ -1086,6 +1136,8 @@ def run_whatweb(t: WebTarget, plan: ToolPlan, timeout: int, stealth: StealthProf
     for h in stealth.default_headers():
         args += ["--header", h]
     args.append(t.url)
+    proxy = PROXY_POOL.next()
+    args = _apply_proxy(args, proxy, "whatweb")
     cmd = build_cmd(plan, args)
     rc, out, err = _run(cmd, timeout)
     findings: list[Finding] = []
@@ -1388,6 +1440,8 @@ def run_nikto(t: WebTarget, plan: ToolPlan, timeout: int, stealth: StealthProfil
             args += ["-RequestHeader", h]
     # else: legacy 2.1.6 — silently skip. Better than a hard exit.
 
+    proxy = PROXY_POOL.next_http_only()
+    args = _apply_proxy(args, proxy, "nikto")
     if plan.runner == "docker":
         cmd = build_cmd(plan, args, mounts=[(host_dir, container_dir)])
     else:
@@ -1547,6 +1601,8 @@ def run_nuclei(targets: list[WebTarget], plan: ToolPlan, severity: str, timeout:
         args += ["-headless", "-page-timeout", "20"]
         if plan.runner == "docker": args += ["-system-chrome"]
 
+    proxy = PROXY_POOL.next()
+    args = _apply_proxy(args, proxy, "nuclei")
     cmd = build_cmd(plan, args, mounts=nuclei_mounts)
 
     log("run", f"nuclei batch ({len(targets)} targets) → {targets[0].url[:40]}...")
@@ -1742,6 +1798,8 @@ def run_wapiti(t: WebTarget, plan: ToolPlan, timeout: int, stealth: StealthProfi
                  "--max-scan-time", str(min(timeout, 1200)),
                  "-v", "1",                  # progress to stdout: "N URLs scanned"
                  "--color"]                  # disable ANSI escape codes
+    proxy = PROXY_POOL.next()
+    extra = _apply_proxy(extra, proxy, "wapiti")
     if plan.runner == "docker":
         container_dir = "/wrk"
         out_arg = f"{container_dir}/{report}"
@@ -1883,6 +1941,8 @@ def run_feroxbuster(t: WebTarget, plan: ToolPlan, timeout: int) -> tuple[list[Fi
     
     args = ["-u", t.url, "-w", f"/wl/{os.path.basename(wl_path)}" if plan.runner == "docker" else wl_path,
             "-d", "2", "--silent", "-o", f"/wrk/{report}" if plan.runner == "docker" else os.path.join(host_dir, report)]
+    proxy = PROXY_POOL.next()
+    args = _apply_proxy(args, proxy, "feroxbuster")
     
     if plan.runner == "docker":
         docker = ["docker","run","--rm","-i","--network","host",
@@ -1926,6 +1986,8 @@ def run_ffuf(t: WebTarget, plan: ToolPlan, timeout: int) -> tuple[list[Finding],
     args = ["-u", target_url, "-w", f"/wl/{os.path.basename(wl_path)}" if plan.runner == "docker" else wl_path,
             "-mc", "200", "-of", "json", "-o", f"/wrk/{report}" if plan.runner == "docker" else os.path.join(host_dir, report),
             "-s"]
+    proxy = PROXY_POOL.next()
+    args = _apply_proxy(args, proxy, "ffuf")
     
     if plan.runner == "docker":
         docker = ["docker","run","--rm","-i","--network","host",
@@ -2017,6 +2079,8 @@ def run_crawler(t: WebTarget, plan: Optional[ToolPlan], timeout: int, stealth: S
     args = ["-u", t.url, "-d", "3", "-c", "10", "-jc", "-json", "-nc", "-H", f"User-Agent: {stealth.pick_ua()}"]
     if stealth.headless:
         args.append("-hl")
+    proxy = PROXY_POOL.next()
+    args = _apply_proxy(args, proxy, "katana")
     cmd = build_cmd(plan, args)
     rc, out, err = _run(cmd, timeout)
     if rc != 0 or not out:
@@ -2132,6 +2196,8 @@ def run_service_nuclei(asset: ServiceTarget, plan: ToolPlan, timeout: int, sever
         nuclei_mount = _nuclei_template_mount()
         if not _ensure_nuclei_templates_ready(plan, f"{asset.host}:{asset.port}"):
             return []
+    proxy = PROXY_POOL.next()
+    args = _apply_proxy(args, proxy, "nuclei")
     cmd = build_cmd(plan, args, mounts=[nuclei_mount] if nuclei_mount else None)
     rc, out, err = _run(cmd, timeout)
     findings: list[Finding] = []
@@ -2772,6 +2838,8 @@ def run_sqlmap(url: str, plan: ToolPlan, timeout: int, stealth: StealthProfile, 
     else:
         extra += ["--delay", "0", "--safe-freq", "3"]
 
+    proxy = PROXY_POOL.next()
+    extra = _apply_proxy(extra, proxy, "sqlmap")
     if plan.runner == "docker":
         container_dir = "/wrk"
         args = ["-u", url, "--disable-coloring", "--output-dir", container_dir, "--timeout", "30"] + extra
@@ -2815,6 +2883,8 @@ def run_sqlmap_batch(urls: list[str], plan: ToolPlan, timeout: int, stealth: Ste
     hdrs = stealth.default_headers()
     if hdrs: extra += ["--headers", "\n".join(hdrs)]
 
+    proxy = PROXY_POOL.next()
+    extra = _apply_proxy(extra, proxy, "sqlmap")
     if plan.runner == "docker":
         container_dir = "/wrk"
         args = ["-m", f"{container_dir}/targets.txt", "--disable-coloring", "--output-dir", container_dir] + extra
@@ -3315,6 +3385,11 @@ def main():
     ap.add_argument("--auth-user", default=None, help="Username for authenticated scanning.")
     ap.add_argument("--auth-pass", default=None, help="Password for authenticated scanning.")
     ap.add_argument("--auth-cookie", default=None, help='Session cookie in "NAME=VALUE" form.')
+    ap.add_argument(
+        "--proxy-file", default=None, metavar="FILE",
+        help="File with one proxy per line (http://host:port or socks5://host:port). "
+             "2-15 proxies; rotated round-robin across tool launches."
+    )
 
     # ── Stealth / polite-mode flags ─────────────────────────────────────
     sg = ap.add_argument_group("stealth / polite-mode",
@@ -3381,7 +3456,7 @@ def main():
     args = ap.parse_args()
 
     # Activate the stealth profile BEFORE any tool runs.
-    global STEALTH, AUTH, SQLMAP_LEVEL, SQLMAP_RISK
+    global STEALTH, AUTH, SQLMAP_LEVEL, SQLMAP_RISK, PROXY_POOL
     STEALTH = StealthProfile(
         polite     = args.polite or args.slow,
         slow       = args.slow,
@@ -3396,6 +3471,29 @@ def main():
     AUTH = AuthProfile(user=args.auth_user, password=args.auth_pass, cookie=args.auth_cookie)
     SQLMAP_LEVEL = args.sqlmap_level
     SQLMAP_RISK = args.sqlmap_risk
+    if args.proxy_file:
+        _raw: list[str] = []
+        with open(args.proxy_file) as _pf:
+            for _ln in _pf:
+                _ln = _ln.strip()
+                if _ln and not _ln.startswith("#"):
+                    _raw.append(_ln)
+        if not (2 <= len(_raw) <= 15):
+            log("err", f"--proxy-file must contain 2-15 proxies, got {len(_raw)}")
+            sys.exit(2)
+        PROXY_POOL = ProxyPool(_raw)
+        _hc = len(PROXY_POOL._http)
+        log("info", f"proxy pool: {len(_raw)} proxies ({_hc} HTTP, {len(_raw)-_hc} SOCKS5)")
+        if not PROXY_POOL._http:
+            log("warn", "no HTTP proxies in pool - nikto will run unproxied")
+
+    if PROXY_POOL:
+        _ps = 2.5
+        for _attr in ("httpx_timeout","whatweb_timeout","wafw00f_timeout","nikto_timeout",
+                      "nuclei_timeout","wapiti_timeout","sqlmap_timeout","ffuf_timeout",
+                      "feroxbuster_timeout","katana_timeout"):
+            setattr(args, _attr, int(getattr(args, _attr) * _ps))
+        log("info", "proxy pool active - all timeouts scaled x2.5")
 
     banner()
     # Surface the active stealth profile so the user knows what's on.
