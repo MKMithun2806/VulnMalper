@@ -2,8 +2,10 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    branches: [main]
+    paths:
+      - "vulnmalper.py"
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -22,21 +24,42 @@ jobs:
           python-version: "3.13"
           enable-cache: true
 
-      - name: Build distributions
+      - name: Extract version from vulnmalper.py
+        id: version
+        run: |
+          VERSION="$(python3 -c 'import re; print(re.search(r"VERSION\s*=\s*\"([0-9.]+)\"", open("vulnmalper.py").read()).group(1))')"
+          echo "VERSION=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "TAG=v${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Build .deb package
+        run: ./build_deb.sh "${{ steps.version.outputs.VERSION }}"
+
+      - name: Build Python distributions
         run: uv build
 
-      - name: Verify distributions
-        run: uv run python -c "import zipfile,glob; [zipfile.ZipFile(f) for f in glob.glob('dist/*.whl')]; print('wheels OK')"
-
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: dist
-          path: dist/
-          retention-days: 90
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
-          generate_release_notes: true
+      - name: Create or refresh GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          TAG="${{ steps.version.outputs.TAG }}"
+          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+          NOTES="Automated build from commit \`${{ github.sha }}\`. Regenerated automatically whenever vulnmalper.py changes."
+          FILES=(
+            "dist/vulnmalper_${VERSION}_all.deb"
+            "dist/vulnmalper-${VERSION}-py3-none-any.whl"
+            "dist/vulnmalper-${VERSION}.tar.gz"
+          )
+          CREATED=0
+          for i in 1 2 3; do
+            if gh release create "$TAG" "${FILES[@]}" \
+              --title "VulnMalper ${TAG}" \
+              --notes "$NOTES"; then
+              CREATED=1
+              break
+            fi
+            echo "release creation attempt ${i} failed, retrying in 5s..."
+            sleep 5
+          done
+          [ "$CREATED" = "1" ] || { echo "failed to create release"; exit 1; }

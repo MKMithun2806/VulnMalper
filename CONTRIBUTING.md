@@ -90,15 +90,26 @@ Useful things to test:
 
 ## Release process (maintainers)
 
-Releases are driven by version tags:
+Releases are automatic. Every change to `vulnmalper.py` on `main` triggers the
+`release` workflow, which:
 
-1. Bump the version in `vulnmalper.py` (`VERSION = "x.y.z"`). The package
-   version is read from this file automatically.
-2. Update `CHANGELOG.md`.
-3. Push a `v<version>` tag (e.g. `v7.3.6`). The `release` workflow builds
-   distributions, uploads artifacts, and creates a GitHub Release.
-4. Creating the Release triggers the `publish` workflow, which publishes the
-   package to PyPI using trusted publishing (no API tokens).
+1. Reads the version from `vulnmalper.py` (`VERSION = "x.y.z"`).
+2. Builds the `.deb` package (`./build_deb.sh`), the wheel, and the sdist.
+3. Creates (or refreshes) a GitHub Release tagged `v<x.y.z>` with those
+   artifacts attached.
+
+You can also run the `release` workflow manually from the Actions dashboard
+("Run workflow").
+
+Publishing to PyPI is a **separate, manual** step and never runs
+automatically:
+
+1. Go to the **Actions** tab in GitHub.
+2. Open the `Publish to PyPI` workflow.
+3. Click **Run workflow**.
+
+The publish workflow builds the package and uploads it to PyPI using trusted
+publishing (OIDC) — no API tokens are required.
 
 ## Code of conduct
 
