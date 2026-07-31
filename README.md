@@ -1,19 +1,45 @@
-# 🛡️ VulnMalper
+# VulnMalper
 
-[![Version](https://img.shields.io/badge/version-7.3.6-blue.svg)](https://github.com/MKMithun2806/VulnMalper)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
-[![Docker](https://img.shields.io/badge/docker-ready-emerald.svg)](https://www.docker.com/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![CI](https://github.com/MKMithun2806/VulnMalper/actions/workflows/ci.yml/badge.svg)](https://github.com/MKMithun2806/VulnMalper/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/vulnmalper.svg)](https://pypi.org/project/vulnmalper/)
 
-**The ultimate vulnerability pipeline that eats [NetMalper](https://github.com/MKMithun2806/NetMalper) graphs for breakfast.**
+VulnMalper is a single-file vulnerability pipeline for
+[NetMalper](https://github.com/MKMithun2806/NetMalper) graphs. It orchestrates
+a multi-stage security auditing workflow — **Fingerprint → Scan → Verify** —
+where every stage intelligently feeds the next, ensuring maximum coverage
+with no blind spraying.
 
-VulnMalper automates a multi-stage security auditing workflow: **Fingerprint → Scan → Verify**. Every stage intelligently feeds the next, ensuring maximum coverage with zero blind spraying.
+It has **zero runtime dependencies** (Python standard library only) and runs
+each tool locally when available, falling back to the tool's official Docker
+image automatically.
 
----
+## Features
 
-## The Pipeline
+- **Fingerprint → Scan → Verify pipeline** driven by a NetMalper JSON graph.
+- **Auto-runner** (`--runner auto`, default): tools run locally if installed,
+  otherwise via their official Docker image.
+- **Session handover:** session cookies from successful `nuclei` or `wapiti`
+  login findings are automatically passed to `sqlmap` for authenticated
+  scanning.
+- **Phase 0 service scanning:** non-web services are profiled with `nmap` and
+  checked against `nuclei` templates.
+- **Crawl + content discovery:** `katana` crawl discovery and `ffuf` /
+  `feroxbuster` content discovery feed new targets back into the pipeline.
+- **WAF awareness:** auto-detects WAFs and adjusts downstream behavior (e.g.
+  SQLMap tamper scripts).
+- **Stealth profiles:** randomized User-Agents, jittered headers/timing, and
+  polite/slow rate-limiting to avoid simple pattern-based detection.
+- **Proxy pool rotation:** load 2-15 proxies from a file with `--proxy-file`;
+  tool launches rotate round-robin, and active proxy mode scales tool
+  timeouts by 2.5x.
+- **Targeted SQLi verification:** `sqlmap` runs only on injectable-looking
+  endpoints surfaced by upstream stages — no blind spraying.
+- **Clean output:** a single actionable **Markdown report**, a high-signal
+  console summary, and optional JSON export.
 
-VulnMalper orchestrates a suite of industry-standard tools, handling dependencies automatically via Docker if they aren't found locally.
+## Pipeline
 
 ```mermaid
 graph TD
@@ -32,26 +58,49 @@ graph TD
     NK -- "Injectable URLs" --> SM
 ```
 
----
+## Installation
 
-<img width="2559" height="1599" alt="image" src="https://github.com/user-attachments/assets/5af9fa3b-9604-4d7b-bf4c-bcf8f324eb28" />
+VulnMalper requires Python 3.9 or newer. It is a self-contained module with
+no runtime dependencies.
 
----
+### With uv (recommended)
 
-### Smart Features
+From PyPI:
 
-*   **Auto-Runner:** Use `--runner auto` (default) to run tools locally if present, falling back to official Docker images otherwise.
-*   **Session Handover:** Automatically captures session cookies from successful `nuclei` or `wapiti` login findings and passes them to `sqlmap` for authenticated scanning.
-*   **Stealth Profiles:** Randomized User-Agents and headers to avoid simple pattern-based detection.
-*   **WAF Awareness:** Automatically detects WAFs and adjusts tool behavior (e.g., adding SQLMap tamper scripts).
-*   **Proxy Pool Rotation:** Load 2-15 proxies from a file with `--proxy-file`; tool launches rotate round-robin, HTTP proxies are reused for Nikto, and active proxy mode scales tool timeouts by 2.5x.
-*   **Zero Bloat:** Outputs a clean, actionable **Markdown report** and a high-signal console summary.
+```bash
+uv tool install vulnmalper
+```
 
----
+From the repository:
 
-## 📦 Installation
+```bash
+uv tool install git+https://github.com/MKMithun2806/VulnMalper
+```
 
-### 1. Quick Install (Debian/Ubuntu)
+Both install a `vulnmalper` executable:
+
+```bash
+vulnmalper --help
+```
+
+### With pip
+
+```bash
+pip install vulnmalper
+```
+
+### From source (no install)
+
+```bash
+git clone https://github.com/MKMithun2806/VulnMalper
+cd VulnMalper
+./vulnmalper.py --help
+```
+
+### Debian/Ubuntu package
+
+Each [GitHub release](https://github.com/MKMithun2806/VulnMalper/releases)
+includes a `.deb` built by `build_deb.sh`:
 
 ```bash
 URL=$(curl -s https://api.github.com/repos/MKMithun2806/VulnMalper/releases/latest | grep browser_download_url | grep .deb | cut -d '"' -f 4)
@@ -59,20 +108,11 @@ curl -L -o vulnmalper.deb "$URL"
 sudo apt install -y ./vulnmalper.deb
 rm vulnmalper.deb
 ```
-*This installs the `vulnmalper` command, man pages, and bash completion.*
 
-### 2. From Source
+### External tool dependencies
 
-```bash
-git clone https://github.com/MKMithun2806/VulnMalper
-cd VulnMalper
-# No python dependencies! Just standard library.
-./vulnmalper.py --help
-```
-
-### 3. External Tool Dependencies
-
-VulnMalper automatically pulls Docker images for missing tools. However, for local execution, you can install them manually:
+VulnMalper pulls official Docker images for any tool that isn't found locally.
+For fully local execution, install the tools yourself:
 
 ```bash
 sudo apt install nikto sqlmap whatweb wafw00f
@@ -82,8 +122,6 @@ go install github.com/projectdiscovery/httpx/cmd/httpx@latest
 go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
 go install github.com/projectdiscovery/katana/cmd/katana@latest
 ```
-
----
 
 ## Usage
 
@@ -96,36 +134,88 @@ vulnmalper targets.json --auth-user admin --auth-pass password123
 
 # Focused scan with high severity only
 vulnmalper targets.json --only nuclei,sqlmap --severity high
+
+# Polite, rate-limited scan
+vulnmalper targets.json --polite --rate-limit 10
+
+# Scan through a rotating proxy pool
+vulnmalper targets.json --proxy-file proxies.txt
+
+# Also write a JSON export next to the Markdown report
+vulnmalper targets.json --export-json
 ```
 
-### Key Flags
+A sample NetMalper graph is provided at `examples/targets.json`.
+
+### Key flags
 
 | Flag | Description |
 | :--- | :--- |
 | `--runner` | `auto` (default), `local`, or `docker`. |
 | `--only` | Comma-separated list of tools to run. |
-| `--threads` | Number of parallel target workers (default: 5). |
+| `--threads` | Number of parallel per-target workers (default: 3). |
 | `--severity` | Minimum nuclei severity to report (`info`, `low`, `medium`, `high`, `critical`). |
-| `--proxy-file` | File with one proxy per line. Use `http://host:port` or `socks5://host:port` entries. |
-| `--out` | Custom name for the Markdown report. |
+| `--max-targets` | Cap the number of targets processed. |
+| `--proxy-file` | File with one proxy per line (`http://host:port` or `socks5://host:port`); 2-15 proxies rotated round-robin. |
+| `--auth-user`, `--auth-pass`, `--auth-cookie` | Credentials for authenticated scanning. |
+| `--out` | Custom base name for the Markdown report. |
+| `--export-json` | Also write a JSON export (bare flag auto-names it next to the report). |
 
-Proxy mode is best paired with a small pool of fresh exits. VulnMalper will reject files outside the 2-15 proxy range and automatically slow the configured scanner timeouts when a pool is active.
+### Stealth / polite-mode flags
 
----
+| Flag | Description |
+| :--- | :--- |
+| `--polite` | Cap req/sec, add ~250ms delays, use browser headers. |
+| `--slow` | Very low req/sec, ~1s delays, Nikto `-Pause 1`; use against WAF-protected targets. |
+| `--user-agent` | Pin a single User-Agent (default: random per run). |
+| `--header` | Extra HTTP header, repeatable (e.g. `--header 'X-Forwarded-For: 1.2.3.4'`). |
+| `--rate-limit` | Hard cap on req/sec for nuclei/httpx (0 = tool default). |
+| `--delay-ms` | Minimum ms between requests for tools that support it. |
+| `--headless` | Enable nuclei `-headless` (Chromium) for JS-rendered endpoints. |
+| `--quiet` | Drop noisy nuclei tags and exposure-config globs; implied by `--polite`/`--slow`. |
+| `--no-jitter` | Disable per-request randomisation of timing and headers. |
 
-## 🏗️ Building from Source
+If no stealth flag is given, **auto mode** is enabled: a per-target strategy
+(stealth / balanced / aggressive) is chosen after Phase 1 based on evidence
+(WAF/CDN → stealth, private IP → aggressive, else balanced).
 
-To build your own `.deb` package:
+### Per-tool timeouts
+
+Each tool has its own `--<tool>-timeout` flag (seconds), e.g. `--nuclei-timeout`,
+`--sqlmap-timeout`. Use `--no-timeout` to lift caps (see `vulnmalper --help`).
+
+## Development
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full guide.
+
+```bash
+git clone https://github.com/MKMithun2806/VulnMalper
+cd VulnMalper
+
+uv sync                                   # create env, install package + dev tools
+uv run pytest                             # run tests
+uv run ruff check .                       # lint
+uv run ruff format --check .              # formatting
+uv run python vulnmalper.py --help        # smoke test
+```
+
+## Building the `.deb` package
 
 ```bash
 ./build_deb.sh 7.3.6
 ```
-*Requires `dpkg-dev`.*
 
----
+Requires `dpkg-dev`. Output: `dist/vulnmalper_<version>_all.deb`.
 
-## 📄 License
+## Documentation
+
+- [Pipeline details](docs/PIPELINE.md)
+- [Changelog](CHANGELOG.md)
+- [Contributing](CONTRIBUTING.md)
+- [Security policy](SECURITY.md)
+
+## License
 
 MIT © [MKMithun](https://github.com/MKMithun2806)
 
-*Pairs perfectly with [NetMalper](https://github.com/MKMithun2806/NetMalper). Crush some boxes.*
+Pairs perfectly with [NetMalper](https://github.com/MKMithun2806/NetMalper).

@@ -1,0 +1,58 @@
+{
+  "meta": {
+    "target": "example.com",
+    "description": "Sample NetMalper graph for VulnMalper",
+    "generated": "2026-01-01T00:00:00Z"
+  },
+  "nodes": [
+    {
+      "id": "root-1",
+      "type": "root",
+      "label": "example.com",
+      "data": {
+        "fqdn": "example.com"
+      }
+    },
+    {
+      "id": "ep-1",
+      "type": "endpoint",
+      "data": {
+        "url": "https://example.com/"
+      }
+    },
+    {
+      "id": "ep-2",
+      "type": "endpoint",
+      "data": {
+        "url": "https://example.com/login?redirect=1"
+      }
+    },
+    {
+      "id": "ep-3",
+      "type": "endpoint",
+      "data": {
+        "url": "https://example.com/api/v1/users?page=1"
+      }
+    },
+    {
+      "id": "p-443",
+      "type": "port",
+      "data": {
+        "host": "93.184.216.34",
+        "port": 443,
+        "service": "https",
+        "product": "nginx"
+      }
+    },
+    {
+      "id": "p-22",
+      "type": "port",
+      "data": {
+        "host": "93.184.216.34",
+        "port": 22,
+        "service": "ssh",
+        "product": "OpenSSH"
+      }
+    }
+  ]
+}

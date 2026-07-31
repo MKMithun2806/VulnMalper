@@ -1,0 +1,28 @@
+# Ensure consistent line endings on all platforms
+* text=auto
+
+# Source files
+*.py text eol=lf
+*.pyi text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.sh text eol=lf
+*.ps1 text eol=lf
+
+# Shell scripts must keep executable bit
+*.sh text eol=lf
+
+# Binary files
+*.png binary
+*.jpg binary
+*.ico binary
+*.whl binary
+*.gz binary
+*.deb binary
+
+# Linguist overrides
+vulnmalper.py linguist-language=Python
+build_deb.sh linguist-language=Shell

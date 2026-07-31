@@ -1,12 +1,76 @@
-dist/
-.aider*
-.codex
+# Byte-compiled / optimized / DLL files
 __pycache__/
-build/
-context.md
+*.py[cod]
+*$py.class
 
-# Nuitka
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyInstaller / Nuitka single-file artifacts
+vulnmalper
 vulnmalper.build/
 vulnmalper.dist/
 vulnmalper.onefile-build/
-vulnmalper
+
+# Unit tests / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+.ruff_cache/
+
+# Type checking
+.mypy_cache/
+.dmypy.json
+dmypy.json
+pyrightconfig.json
+*.pyright
+.pytype/
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+pythonenv*
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# AI assistant working files
+.aider*
+.codex
+context.md

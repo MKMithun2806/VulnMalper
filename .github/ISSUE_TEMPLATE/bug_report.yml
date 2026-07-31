@@ -1,0 +1,68 @@
+name: Bug report
+description: Report a bug in VulnMalper
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to fill out this bug report. Please make sure you are not duplicating an existing issue.
+  - type: input
+    id: version
+    attributes:
+      label: VulnMalper version
+      description: Output of `vulnmalper --help` or `vulnmalper.py --help`.
+      placeholder: e.g. 7.3.6
+    validations:
+      required: true
+  - type: dropdown
+    id: runner
+    attributes:
+      label: Tool runner
+      description: Which runner was active when the bug occurred?
+      options:
+        - auto (default)
+        - local
+        - docker
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear and concise description of the bug. Include the exact command that triggered it.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+      description: A clear and concise description of what you expected to happen.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: Paste any console output, stack traces, or report excerpts. Avoid posting sensitive data.
+      render: shell
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Python version, Docker availability, and any external tools installed (nuclei, sqlmap, etc.).
+      placeholder: |
+        - OS: Ubuntu 24.04
+        - Python: 3.12
+        - Docker: 27.x
+        - Installed tools: httpx, nuclei, sqlmap
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      description: Confirm you have done the following.
+      options:
+        - label: I have searched existing issues for duplicates
+          required: true
+        - label: I have redacted all sensitive/private data from the report
+          required: true

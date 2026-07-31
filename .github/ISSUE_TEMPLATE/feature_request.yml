@@ -1,0 +1,37 @@
+name: Feature request
+description: Suggest an enhancement for VulnMalper
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting a new feature. Please keep the scope aligned with VulnMalper's single-file design and its fingerprint -> scan -> verify pipeline.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What is the problem you are trying to solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: How should VulnMalper behave? Include concrete CLI flags or tool integrations if relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: Any alternative approaches you considered.
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      description: How would this change the project?
+      options:
+        - label: It does not change existing CLI arguments or output
+        - label: It does not split the single-file application into modules
+        - label: It adds a new external tool integration
