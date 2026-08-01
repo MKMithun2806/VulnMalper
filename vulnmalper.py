@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VulnMalper v7.3.6  —  Vulnerability pipeline for NetMalper graphs.
+VulnMalper v8.0.0  —  Vulnerability pipeline for NetMalper graphs.
 
 Pipeline:
     NetMalper JSON
@@ -56,7 +56,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-VERSION = "7.3.6"
+VERSION = "8.0.0"
 
 # ── Interrupt handling (Ctrl+C) ────────────────────────────────────────────
 # Registry of in-flight child processes so a SIGINT/SIGTERM can terminate

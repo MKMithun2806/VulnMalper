@@ -106,7 +106,7 @@ scripts can also be run locally:
 
 ```bash
 # Debian/Ubuntu .deb (requires dpkg-dev)
-./build_deb.sh 7.3.6
+./build_deb.sh 8.0.0
 
 # Alpine Linux (musl) one-file binary — run inside the official Alpine container
 docker run --rm -v "$PWD":/work -w /work \
@@ -128,7 +128,7 @@ rm vulnmalper.deb
 Install the Alpine binary with:
 
 ```bash
-wget -O /usr/local/bin/vulnmalper https://github.com/MKMithun2806/VulnMalper/releases/latest/download/vulnmalper-v7.3.6-alpine-musl
+wget -O /usr/local/bin/vulnmalper https://github.com/MKMithun2806/VulnMalper/releases/latest/download/vulnmalper-v8.0.0-alpine-musl
 chmod +x /usr/local/bin/vulnmalper
 ```
 

@@ -12,7 +12,7 @@ body:
     attributes:
       label: VulnMalper version
       description: Output of `vulnmalper --help` or `vulnmalper.py --help`.
-      placeholder: e.g. 7.3.6
+      placeholder: e.g. 8.0.0
     validations:
       required: true
   - type: dropdown

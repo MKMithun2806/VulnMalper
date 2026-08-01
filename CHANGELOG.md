@@ -5,6 +5,19 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [8.0.0] - 2026-08-01
+
+### Fixed
+
+- Nuclei templates are now properly populated and readable: the update writes
+  into the mounted template dir and fixes permissions from inside the
+  container, and nuclei loads the mounted set explicitly in both the endpoint
+  and service-scan paths.
+- Graceful shutdown: Ctrl+C / SIGTERM terminate running tools and leave no
+  orphaned child processes behind.
+- `.deb` builds no longer require root (`dpkg-deb --root-owner-group` is used
+  when `fakeroot` is unavailable).
+
 ## [7.3.6] - 2026-01-15
 
 ### Changed
@@ -73,6 +86,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Initial single-file release: fingerprint -> scan -> verify pipeline driven
   by NetMalper JSON graphs.
 
+[8.0.0]: https://github.com/MKMithun2806/VulnMalper/releases/tag/v8.0.0
 [7.3.6]: https://github.com/MKMithun2806/VulnMalper/releases/tag/v7.3.6
 [7.3.5]: https://github.com/MKMithun2806/VulnMalper/releases/tag/v7.3.5
 [7.3.0]: https://github.com/MKMithun2806/VulnMalper/releases/tag/v7.3.0
