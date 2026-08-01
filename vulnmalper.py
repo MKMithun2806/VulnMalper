@@ -843,19 +843,29 @@ def warm_nuclei_templates(plan: Optional[ToolPlan]):
         def _worker():
             global NUCLEI_TEMPLATE_RESULT
             try:
-                template_dir = os.path.expanduser("~/.cache/vulnmalper/nuclei-templates")
-                try:
-                    os.makedirs(template_dir, exist_ok=True)
-                except Exception:
-                    template_dir = os.path.join(tempfile.gettempdir(), f"vulnmalper_nuclei_{os.getuid()}")
-                    os.makedirs(template_dir, exist_ok=True)
+                template_dir = _nuclei_template_host_dir()
+                wait_for_docker_image(plan)
+                # Update explicitly INTO the mounted dir (-ud) regardless of the
+                # image's $HOME, then chmod the tree world-readable: the
+                # container writes as root with mode 700, so without this the
+                # host user cannot read the templates and the dir looks empty.
+                update_cmd = [
+                    "docker", "run", "--rm", "-i", "--network", "host",
+                    "-v", f"{template_dir}:/root/nuclei-templates",
+                    "--entrypoint", "sh", plan.image, "-c",
+                    "nuclei -update-templates -ud /root/nuclei-templates -silent && "
+                    "chmod -R a+rX /root/nuclei-templates",
+                ]
 
                 log("info", "Refreshing Nuclei templates in background...")
-                cmd = build_cmd(plan, ["-update-templates", "-silent"], mounts=[(template_dir, "/root/nuclei-templates")])
-                rc, out, err = _run(cmd, 300)
+                p = _subprocess_run(update_cmd, capture_output=True, text=True,
+                                    timeout=300, env=_docker_env())
+                rc, out, err = p.returncode, p.stdout, p.stderr
                 if rc != 0:
                     log("warn", f"Nuclei template refresh failed (rc={rc}), retrying...")
-                    rc2, out2, err2 = _run(cmd, 300)
+                    p2 = _subprocess_run(update_cmd, capture_output=True, text=True,
+                                         timeout=300, env=_docker_env())
+                    rc2, out2, err2 = p2.returncode, p2.stdout, p2.stderr
                     NUCLEI_TEMPLATE_RESULT = (rc2 == 0)
                     if rc2 == 0:
                         msg = out2.strip() or err2.strip() or "done"
@@ -1705,6 +1715,7 @@ def run_nuclei(targets: list[WebTarget], plan: ToolPlan, severity: str, timeout:
             return []
         nuclei_mounts.append((template_dir, "/root/nuclei-templates"))
         nuclei_mounts.append((host_dir, "/wrk"))
+        args += ["-t", "/root/nuclei-templates"]
 
     # Stealth options
     if stealth.polite or stealth.slow or stealth.quiet:
@@ -2312,6 +2323,7 @@ def run_service_nuclei(asset: ServiceTarget, plan: ToolPlan, timeout: int, sever
         nuclei_mount = _nuclei_template_mount()
         if not _ensure_nuclei_templates_ready(plan, f"{asset.host}:{asset.port}"):
             return []
+        args += ["-t", "/root/nuclei-templates"]
     proxy = PROXY_POOL.next()
     args = _apply_proxy(args, proxy, "nuclei")
     cmd = build_cmd(plan, args, mounts=[nuclei_mount] if nuclei_mount else None)
