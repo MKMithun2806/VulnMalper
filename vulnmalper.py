@@ -49,12 +49,75 @@ import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 import html.parser
+import glob
+import signal
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 VERSION = "7.3.6"
+
+# ── Interrupt handling (Ctrl+C) ────────────────────────────────────────────
+# Registry of in-flight child processes so a SIGINT/SIGTERM can terminate
+# every spawned tool before we exit — leaving no orphaned processes behind.
+_ACTIVE_CHILDREN: dict[int, subprocess.Popen] = {}
+_ACTIVE_CHILDREN_LOCK = threading.Lock()
+_INTERRUPTED = False
+
+
+def _register_child(proc: subprocess.Popen) -> None:
+    with _ACTIVE_CHILDREN_LOCK:
+        _ACTIVE_CHILDREN[proc.pid] = proc
+
+
+def _unregister_child(proc: subprocess.Popen) -> None:
+    with _ACTIVE_CHILDREN_LOCK:
+        _ACTIVE_CHILDREN.pop(proc.pid, None)
+
+
+def _terminate_children() -> None:
+    """SIGTERM every tracked child, then SIGKILL stragglers after a grace
+    period so no tool keeps running after vulnmalper exits."""
+    with _ACTIVE_CHILDREN_LOCK:
+        procs = list(_ACTIVE_CHILDREN.values())
+    for p in procs:
+        try:
+            if p.poll() is None:
+                p.terminate()
+        except Exception:
+            pass
+    if procs:
+        time.sleep(0.75)
+    for p in procs:
+        try:
+            if p.poll() is None:
+                p.kill()
+        except Exception:
+            pass
+
+
+def _cleanup_temp_dirs() -> None:
+    """Best-effort removal of VulnMalper working directories under /tmp."""
+    for d in glob.glob("/tmp/vulnmalper_*"):
+        try:
+            if os.path.isdir(d):
+                shutil.rmtree(d, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def _handle_signal(signum: int, frame) -> None:
+    global _INTERRUPTED
+    if _INTERRUPTED:
+        os._exit(128 + signum)  # second interrupt: force immediate exit
+    _INTERRUPTED = True
+    print("", flush=True)
+    log("warn", "Interrupted — terminating running tools and cleaning up...")
+    _terminate_children()
+    _cleanup_temp_dirs()
+    log("warn", "Shutting down. No orphaned processes left behind.")
+    os._exit(128 + signum)
 
 # Background warmup state for docker images and nuclei templates.
 DOCKER_IMAGE_EVENTS: dict[str, threading.Event] = {}
@@ -625,7 +688,7 @@ def _docker_env() -> dict:
     sudo_user = os.environ.get("SUDO_USER") or os.environ.get("DOAS_USER")
     if sudo_user:
         try:
-            pwd = subprocess.run(
+            pwd = _subprocess_run(
                 ["getent", "passwd", sudo_user],
                 capture_output=True, text=True, timeout=4,
             )
@@ -651,7 +714,7 @@ def _docker_env() -> dict:
 def docker_available() -> bool:
     if not have("docker"): return False
     try:
-        p = subprocess.run(["docker","info"], capture_output=True, text=True,
+        p = _subprocess_run(["docker","info"], capture_output=True, text=True,
                            timeout=15, env=_docker_env())
         return p.returncode == 0
     except Exception:
@@ -701,7 +764,7 @@ def ensure_docker_image(image: str, quiet: bool = False):
     env = _docker_env()
     for candidate in _image_candidates(image):
         try:
-            subprocess.run(["docker", "image", "inspect", candidate],
+            _subprocess_run(["docker", "image", "inspect", candidate],
                            capture_output=True, text=True, timeout=10,
                            env=env, check=True)
             return True
@@ -719,7 +782,7 @@ def ensure_docker_image(image: str, quiet: bool = False):
     for attempt, timeout in ((1, 120), (2, 300)):
         for candidate in _image_candidates(image):
             try:
-                subprocess.run(["docker", "pull", candidate],
+                _subprocess_run(["docker", "pull", candidate],
                                capture_output=True, text=True, timeout=timeout,
                                env=env, check=True)
                 return True
@@ -910,23 +973,76 @@ def _format_cmd(cmd: list[str]) -> str:
     except Exception:
         return " ".join(str(part) for part in cmd)
 
+def _subprocess_run(cmd, **kwargs):
+    """subprocess.run() replacement that registers the child process so the
+    Ctrl+C handler can terminate it — no orphaned/zombie processes survive an
+    interrupt. Mirrors subprocess.run() semantics (timeout raises
+    TimeoutExpired after killing the child; check raises CalledProcessError)."""
+    timeout = kwargs.pop("timeout", None)
+    check = kwargs.pop("check", False)
+    capture = kwargs.pop("capture_output", False)
+    text = kwargs.pop("text", False)
+    env = kwargs.pop("env", None)
+    input_data = kwargs.pop("input", None)
+    stdin = subprocess.PIPE if input_data is not None else kwargs.pop("stdin", None)
+    stdout = subprocess.PIPE if capture else kwargs.pop("stdout", None)
+    stderr = subprocess.PIPE if capture else kwargs.pop("stderr", None)
+    p = subprocess.Popen(cmd, stdin=stdin, stdout=stdout, stderr=stderr,
+                         env=env, text=text, **kwargs)
+    _register_child(p)
+    try:
+        out, err = p.communicate(input=input_data, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        try:
+            p.kill()
+        except Exception:
+            pass
+        try:
+            out, err = p.communicate()
+        except Exception:
+            out = getattr(e, "output", None)
+            err = getattr(e, "stderr", None)
+        raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err)
+    finally:
+        _unregister_child(p)
+    if check and p.returncode != 0:
+        raise subprocess.CalledProcessError(p.returncode, cmd, output=out, stderr=err)
+    return subprocess.CompletedProcess(cmd, p.returncode, out, err)
+
 def _run(cmd, timeout, stdin_data: Optional[str] = None):
     cmd_text = _format_cmd(cmd)
     try:
-        p = subprocess.run(cmd, input=stdin_data, capture_output=True,
-                           text=True, timeout=timeout)
-        return p.returncode, p.stdout, p.stderr
-    except subprocess.TimeoutExpired as e:
-        stdout = _coerce_subprocess_text(getattr(e, "stdout", ""))
-        stderr = _coerce_subprocess_text(getattr(e, "stderr", ""))
-        parts = [f"timeout after {timeout}s"]
-        if cmd_text:
-            parts.append(f"while running: {cmd_text}")
-        if stderr.strip():
-            parts.append("stderr: " + stderr.strip())
-        if stdout.strip():
-            parts.append("stdout: " + stdout.strip())
-        return 124, stdout, "\n".join(parts)
+        p = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE if stdin_data is not None else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        _register_child(p)
+        try:
+            stdout, stderr = p.communicate(input=stdin_data, timeout=timeout)
+        except subprocess.TimeoutExpired as e:
+            try:
+                p.kill()
+            except Exception:
+                pass
+            try:
+                stdout, stderr = p.communicate()
+            except Exception:
+                stdout = _coerce_subprocess_text(getattr(e, "stdout", ""))
+                stderr = _coerce_subprocess_text(getattr(e, "stderr", ""))
+            parts = [f"timeout after {timeout}s"]
+            if cmd_text:
+                parts.append(f"while running: {cmd_text}")
+            if stderr.strip():
+                parts.append("stderr: " + stderr.strip())
+            if stdout.strip():
+                parts.append("stdout: " + stdout.strip())
+            return 124, stdout, "\n".join(parts)
+        finally:
+            _unregister_child(p)
+        return p.returncode, stdout, stderr
     except FileNotFoundError as e:
         return 127, "", f"{cmd_text}: {e}" if cmd_text else str(e)
     except Exception as e:
@@ -1697,7 +1813,7 @@ def _wapiti_valid_modules(image: Optional[str]) -> set[str]:
     WAPITI_VALID_MODULES = set()
     WAPITI_VALID_MODULES_IMAGE = image
     try:
-        p = subprocess.run(
+        p = _subprocess_run(
             ["docker", "run", "--rm", "--network", "host", image, "--list-modules"],
             capture_output=True, text=True, timeout=60, env=_docker_env(),
         )
@@ -3351,6 +3467,11 @@ def _phase(label: str):
     log("phase", f"{C.B}{label}{C.R}")
 
 def main():
+    # Graceful interrupt handling: on Ctrl+C / SIGTERM, terminate all running
+    # tools and exit cleanly instead of leaving orphaned processes behind.
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+
     ap = argparse.ArgumentParser(
         prog="vulnmalper",
         description="Vulnerability pipeline for NetMalper graphs.",
