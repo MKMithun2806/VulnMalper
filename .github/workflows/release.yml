@@ -37,6 +37,13 @@ jobs:
       - name: Build Python distributions
         run: uv build
 
+      - name: Build Alpine (musl) binary
+        run: |
+          docker run --rm \
+            -v "$PWD":/work -w /work \
+            alpine:3.21 \
+            sh -c "apk add --no-cache python3 py3-pip gcc musl-dev python3-dev binutils curl ca-certificates >/dev/null 2>&1 && sh build_alpine.sh ${{ steps.version.outputs.VERSION }}"
+
       - name: Create or refresh GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -50,6 +57,7 @@ jobs:
             "dist/vulnmalper_${VERSION}_all.deb"
             "dist/vulnmalper-${VERSION}-py3-none-any.whl"
             "dist/vulnmalper-${VERSION}.tar.gz"
+            "dist/vulnmalper-v${VERSION}-alpine-musl"
           )
           CREATED=0
           for i in 1 2 3; do

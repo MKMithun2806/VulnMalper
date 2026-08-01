@@ -29,6 +29,7 @@ vulnmalper
 vulnmalper.build/
 vulnmalper.dist/
 vulnmalper.onefile-build/
+.venv-alpine/
 
 # Unit tests / coverage reports
 htmlcov/

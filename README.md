@@ -97,16 +97,39 @@ cd VulnMalper
 ./vulnmalper.py --help
 ```
 
-### Debian/Ubuntu package
+## Building platform packages
 
 Each [GitHub release](https://github.com/MKMithun2806/VulnMalper/releases)
-includes a `.deb` built by `build_deb.sh`:
+attaches a `.deb`, Python distributions (wheel + sdist), and a self-contained
+Alpine Linux (musl) binary. They are built by the `release` workflow; the
+scripts can also be run locally:
+
+```bash
+# Debian/Ubuntu .deb (requires dpkg-dev)
+./build_deb.sh 7.3.6
+
+# Alpine Linux (musl) one-file binary — run inside the official Alpine container
+docker run --rm -v "$PWD":/work -w /work \
+  alpine:3.21 sh -c "apk add --no-cache python3 py3-pip gcc musl-dev python3-dev binutils curl ca-certificates >/dev/null 2>&1 && sh build_alpine.sh"
+
+# Windows EXE (requires PowerShell + Nuitka)
+powershell -File build_exe.ps1
+```
+
+Install the `.deb` with:
 
 ```bash
 URL=$(curl -s https://api.github.com/repos/MKMithun2806/VulnMalper/releases/latest | grep browser_download_url | grep .deb | cut -d '"' -f 4)
 curl -L -o vulnmalper.deb "$URL"
 sudo apt install -y ./vulnmalper.deb
 rm vulnmalper.deb
+```
+
+Install the Alpine binary with:
+
+```bash
+wget -O /usr/local/bin/vulnmalper https://github.com/MKMithun2806/VulnMalper/releases/latest/download/vulnmalper-v7.3.6-alpine-musl
+chmod +x /usr/local/bin/vulnmalper
 ```
 
 ### External tool dependencies
@@ -196,16 +219,8 @@ uv sync                                   # create env, install package + dev to
 uv run pytest                             # run tests
 uv run ruff check .                       # lint
 uv run ruff format --check .              # formatting
-uv run python vulnmalper.py --help        # smoke test
+ uv run python vulnmalper.py --help        # smoke test
 ```
-
-## Building the `.deb` package
-
-```bash
-./build_deb.sh 7.3.6
-```
-
-Requires `dpkg-dev`. Output: `dist/vulnmalper_<version>_all.deb`.
 
 ## Documentation
 
