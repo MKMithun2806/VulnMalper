@@ -63,6 +63,9 @@ graph TD
 VulnMalper requires Python 3.9 or newer. It is a self-contained module with
 no runtime dependencies.
 
+See [docs/INSTALLATION.md](docs/INSTALLATION.md) for the full guide covering
+`uv`, `pip`, `.deb`, Alpine (musl), Docker, Windows, and from-source installs.
+
 ### With uv (recommended)
 
 From PyPI:
@@ -224,6 +227,7 @@ uv run ruff format --check .              # formatting
 
 ## Documentation
 
+- [Installation guide](docs/INSTALLATION.md)
 - [Pipeline details](docs/PIPELINE.md)
 - [Changelog](CHANGELOG.md)
 - [Contributing](CONTRIBUTING.md)
