@@ -5,6 +5,10 @@ on:
     branches: [main]
     paths:
       - "vulnmalper.py"
+      - "build_deb.sh"
+      - "build_alpine.sh"
+      - "build_exe.ps1"
+      - ".github/workflows/release.yml"
   workflow_dispatch:
 
 permissions:
@@ -34,12 +38,16 @@ jobs:
       - name: Build .deb package
         run: |
           set -euo pipefail
-          if ! ./build_deb.sh "${{ steps.version.outputs.VERSION }}"; then
-            echo ">> build_deb.sh failed; installing fakeroot and retrying..."
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq fakeroot dpkg-dev
-            ./build_deb.sh "${{ steps.version.outputs.VERSION }}"
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          chmod +x build_deb.sh
+          if ! ./build_deb.sh "$VERSION"; then
+            echo ">> direct build failed; retrying as root inside a Debian container..."
+            mkdir -p dist && chmod 777 dist
+            docker run --rm -v "$PWD":/work -w /work \
+              debian:bookworm-slim \
+              bash -c "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq dpkg-dev >/dev/null 2>&1 && bash build_deb.sh '$VERSION'"
           fi
+          ls -lh dist/vulnmalper_${VERSION}_all.deb
 
       - name: Build Python distributions
         run: uv build
