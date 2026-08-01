@@ -32,7 +32,14 @@ jobs:
           echo "TAG=v${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Build .deb package
-        run: ./build_deb.sh "${{ steps.version.outputs.VERSION }}"
+        run: |
+          set -euo pipefail
+          if ! ./build_deb.sh "${{ steps.version.outputs.VERSION }}"; then
+            echo ">> build_deb.sh failed; installing fakeroot and retrying..."
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq fakeroot dpkg-dev
+            ./build_deb.sh "${{ steps.version.outputs.VERSION }}"
+          fi
 
       - name: Build Python distributions
         run: uv build

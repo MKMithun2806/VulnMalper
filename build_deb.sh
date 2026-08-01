@@ -153,8 +153,15 @@ EOF
 
 mkdir -p dist
 OUT="dist/vulnmalper_${VERSION}_all.deb"
-fakeroot_cmd=""
-command -v fakeroot >/dev/null 2>&1 && fakeroot_cmd="fakeroot"
-$fakeroot_cmd dpkg-deb --build "$ROOT" "$OUT"
+if command -v fakeroot >/dev/null 2>&1; then
+  fakeroot dpkg-deb --build "$ROOT" "$OUT"
+elif dpkg-deb --help 2>&1 | grep -q -- '--root-owner-group'; then
+  # dpkg-deb >= 1.19.5 can set root ownership itself, no root needed.
+  dpkg-deb --root-owner-group --build "$ROOT" "$OUT"
+else
+  echo "error: cannot build .deb without root (no fakeroot, no --root-owner-group support)" >&2
+  echo "       install fakeroot:  sudo apt install -y fakeroot" >&2
+  exit 1
+fi
 echo ">> Built: $OUT"
 dpkg-deb --info "$OUT" | sed -n '1,15p'
