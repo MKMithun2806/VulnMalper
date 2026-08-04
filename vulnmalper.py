@@ -1798,24 +1798,51 @@ WAPITI_SEV_MAP = {1:"low",2:"medium",3:"high",4:"critical",0:"info",
                   "Low":"low","Medium":"medium","High":"high",
                   "Critical":"critical","Informational":"info"}
 
-# Wapiti 3.2.10 module list. Source of truth:
-# https://github.com/wapiti-scanner/wapiti/tree/master/wapitiCore/attack (mod_*.py)
-# Dropped names that are NOT in 3.2.10: cookieflags, csp, headers, blindsqli,
-# brute_login, takeover (renamed in 3.x). `timesql` IS still a real module in
-# 3.2.10 (it is the time-based complement to error-based `sql`).
+# Wapiti 3.2.10 module list. Source of truth (scraped 2026-08-04):
+#   ghcr.io/mkmithun2806/wapiti:latest runs Wapiti 3.2.10
+#   (latest upstream release, https://github.com/wapiti-scanner/wapiti/releases)
+#   and its `--list-modules` output exposes exactly:
+#   backup, brute_login_form, buster, cms, crlf, csrf, exec, file, htaccess,
+#   htp, ldap, log4shell, methods, network_device, nikto, permanentxss, printer,
+#   redirect, shellshock, spring4shell, sql, ssl, ssrf, takeover, timesql,
+#   upload, wapp, wp_enum, xss, xxe
+# Subdomain takeover is the `takeover` module (wapitiCore/attack/mod_takeover.py).
+# There is NO `subdomaintakeover` module in any 3.x — passing it makes wapiti
+# exit with rc=2 "Invalid argument for option -m". `network_device`, `printer`
+# and `wp_enum` are base/deprecated classes that do nothing when run standalone,
+# so they are intentionally omitted here.
 WAPITI_MODULES_REQUESTED = (
     "backup,brute_login_form,buster,cms,crlf,csrf,exec,file,htaccess,htp,ldap,"
     "log4shell,methods,nikto,permanentxss,redirect,shellshock,spring4shell,sql,"
-    "ssl,ssrf,subdomaintakeover,takeover,timesql,upload,wapp,xss,xxe"
+    "ssl,ssrf,takeover,timesql,upload,wapp,xss,xxe"
 )
+
+# Authoritative module set for the 3.2.10 image, used when the runtime probe
+# (`--list-modules`) fails/times out so we never pass a bogus module name.
+WAPITI_MODULES_FALLBACK = {
+    "backup","brute_login_form","buster","cms","crlf","csrf","exec","file",
+    "htaccess","htp","ldap","log4shell","methods","nikto","permanentxss",
+    "redirect","shellshock","spring4shell","sql","ssl","ssrf","takeover",
+    "timesql","upload","wapp","xss","xxe",
+}
 
 # Cache of "what modules does THIS wapiti image actually expose", keyed
 # by image ref. Populated lazily on first wapiti run, then reused.
 WAPITI_VALID_MODULES: Optional[set[str]] = None
 WAPITI_VALID_MODULES_IMAGE: Optional[str] = None
 
+# A wapiti module name is a lowercase snake_case identifier (e.g. `exec`,
+# `brute_login_form`). `--list-modules` annotates default-enabled ones as
+# `exec (used by default)`, so we take the first token of each line and only
+# keep tokens that look like a module name. Description lines start with a
+# capitalised word ("Detect ...", "Uncover ...") and never match.
+_WAPITI_MODULE_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+
 def _wapiti_valid_modules(image: Optional[str]) -> set[str]:
-    """Ask the wapiti image for `--list-modules` and parse the names. Cached."""
+    """Ask the wapiti image for `--list-modules` and parse the names. Cached.
+    Falls back to the known-good 3.2.10 set (WAPITI_MODULES_FALLBACK) if the
+    probe fails, so a flaky docker call can never resurrect bogus module names
+    like `subdomaintakeover`."""
     global WAPITI_VALID_MODULES, WAPITI_VALID_MODULES_IMAGE
     if not image:
         return set()
@@ -1824,21 +1851,25 @@ def _wapiti_valid_modules(image: Optional[str]) -> set[str]:
     WAPITI_VALID_MODULES = set()
     WAPITI_VALID_MODULES_IMAGE = image
     try:
+        # No --network host here: `--list-modules` needs no network and host
+        # networking is unsupported on Docker Desktop / macOS / Windows.
         p = _subprocess_run(
-            ["docker", "run", "--rm", "--network", "host", image, "--list-modules"],
+            ["docker", "run", "--rm", image, "--list-modules"],
             capture_output=True, text=True, timeout=60, env=_docker_env(),
         )
         # Format:
         #   [*] Available modules:
         #           backup
         #                   Uncover backup files on the web server.
-        #           brute_login_form
-        #                   ...
+        #           exec (used by default)
+        #                   Detect scripts vulnerable to ...
         for ln in (p.stdout or "").splitlines():
             stripped = ln.strip()
-            if not stripped or stripped.startswith("[*]") or " " in stripped:
+            if not stripped:
                 continue
-            WAPITI_VALID_MODULES.add(stripped)
+            name = stripped.split()[0]
+            if _WAPITI_MODULE_RE.match(name):
+                WAPITI_VALID_MODULES.add(name)
         if not WAPITI_VALID_MODULES:
             log("warn", f"wapiti --list-modules returned no module names; "
                        f"stdout={len(p.stdout)}B stderr={len(p.stderr)}B")
@@ -1846,6 +1877,9 @@ def _wapiti_valid_modules(image: Optional[str]) -> set[str]:
         log("warn", f"wapiti --list-modules timed out for {image}")
     except Exception as e:
         log("warn", f"wapiti --list-modules failed: {e}")
+    if not WAPITI_VALID_MODULES:
+        WAPITI_VALID_MODULES = set(WAPITI_MODULES_FALLBACK)
+        log("warn", f"wapiti: using verified 3.2.10 module fallback set for {image}")
     return WAPITI_VALID_MODULES
 
 def _wapiti_filter_modules(requested_csv: str, image: Optional[str]) -> str:
