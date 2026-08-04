@@ -110,7 +110,7 @@ git clone https://github.com/MKMithun2806/VulnMalper
 cd VulnMalper
 sudo apt install -y dpkg-dev
 ./build_deb.sh                 # version is read from vulnmalper.py
-# or: ./build_deb.sh 8.0.0     # to pin a version
+# or: ./build_deb.sh 8.1.0     # to pin a version
 sudo apt install -y ./dist/vulnmalper_*_all.deb
 ```
 
@@ -135,12 +135,12 @@ runtime.
 
 ```bash
 wget -O /usr/local/bin/vulnmalper \
-  https://github.com/MKMithun2806/VulnMalper/releases/latest/download/vulnmalper-v8.0.0-alpine-musl
+  https://github.com/MKMithun2806/VulnMalper/releases/latest/download/vulnmalper-v8.1.0-alpine-musl
 chmod +x /usr/local/bin/vulnmalper
 vulnmalper --help
 ```
 
-(Replace `8.0.0` with the version of the release you want.)
+(Replace `8.1.0` with the version of the release you want.)
 
 ### Build it yourself
 
@@ -188,7 +188,7 @@ docker run --rm -v "$PWD":/work -w /work \
 # Alpine image (musl binary route)
 docker run --rm -v "$PWD":/work -w /work \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  alpine:3.21 sh -c "wget -O /usr/local/bin/vulnmalper https://github.com/MKMithun2806/VulnMalper/releases/latest/download/vulnmalper-v8.0.0-alpine-musl && chmod +x /usr/local/bin/vulnmalper && vulnmalper --help"
+  alpine:3.21 sh -c "wget -O /usr/local/bin/vulnmalper https://github.com/MKMithun2806/VulnMalper/releases/latest/download/vulnmalper-v8.1.0-alpine-musl && chmod +x /usr/local/bin/vulnmalper && vulnmalper --help"
 ```
 
 Mounting `/var/run/docker.sock` lets VulnMalper in the container reach the
