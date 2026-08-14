@@ -55,7 +55,7 @@ vulnmalper = "vulnmalper:main"
 [dependency-groups]
 dev = [
     "pytest>=8.0",
-    "ruff>=0.9",
+    "ruff>=0.16.2",
 ]
 
 [tool.hatch.version]
